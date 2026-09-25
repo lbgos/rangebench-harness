@@ -15,7 +15,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .agent import AnthropicChatClient, ChatClient, ChatClientProtocol
+from .agent import AnthropicChatClient, ChatClient, ChatClientProtocol, Usage
 from .env import TASKS_DIR, load_all, load_task
 from .identity import all_task_identities
 from .runner import (
@@ -25,13 +25,57 @@ from .runner import (
     DEFAULT_THRESHOLD,
     FAIL_CLASSES,
     MAX_CTX_WINDOW,
+    MAX_WALL_CLOCK_SCALE,
     classify_end_reason,
     run_attempt,
     run_oracle,
+    wall_clock_scale_for,
 )
 
 RESULTS = Path(__file__).resolve().parent.parent / "results"
-MAX_WALL_CLOCK_SCALE = 100.0
+PROBE_MESSAGES = [{"role": "user", "content": "Reply with exactly: COMMAND:\necho ok"}]
+PROBE_MAX_TOKENS = 512
+
+
+def _probe_once(client: ChatClientProtocol) -> tuple[float, str, Usage, str | None]:
+    """One probe call: (elapsed seconds, content, usage, error)."""
+    start = time.perf_counter()
+    content, usage, err = client.chat(PROBE_MESSAGES, PROBE_MAX_TOKENS)
+    return time.perf_counter() - start, content, usage, err
+
+
+def _as_number(value: object) -> float | None:
+    """The value as a float if it is a JSON number (not a bool), else None."""
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def _load_wall_clock_reference(path: str) -> dict:
+    """Read and validate a --wall-clock-reference file; SystemExit on any problem."""
+    try:
+        reference = json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        raise SystemExit(f"--wall-clock-reference {path}: file not found") from None
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"--wall-clock-reference {path}: cannot read JSON: {exc}") from None
+    if not isinstance(reference, dict):
+        raise SystemExit(f"--wall-clock-reference {path}: expected a JSON object")
+    tps = _as_number(reference.get("reference_tps"))
+    if tps is None or not math.isfinite(tps) or tps <= 0:
+        raise SystemExit(f"--wall-clock-reference {path}: reference_tps must be a number above 0")
+    by_tier = reference.setdefault("tool_share_by_tier", {})
+    if not isinstance(by_tier, dict):
+        raise SystemExit(f"--wall-clock-reference {path}: tool_share_by_tier must be an object")
+    shares = {"tool_share_default": reference.get("tool_share_default")}
+    shares.update({f"tool_share_by_tier[{k!r}]": v for k, v in by_tier.items()})
+    for name, raw in shares.items():
+        share = _as_number(raw)
+        if share is None or not 0 <= share <= 1:
+            raise SystemExit(
+                f"--wall-clock-reference {path}: {name} must be a number between 0 and 1"
+            )
+    return reference
 
 
 def _wilson(p: float, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -150,6 +194,9 @@ def _write_manifest(log_dir: Path, doc: dict, extra: dict | None = None) -> None
         "compact": doc.get("compact"),
         "selected_tasks": doc.get("selected_tasks"),
         "trials": doc.get("trials"),
+        "wall_clock_reference": doc.get("wall_clock_reference"),
+        "wall_clock_scale_mode": doc.get("wall_clock_scale_mode"),
+        "model_tps": doc.get("model_tps"),
         "wall_clock_scale": doc.get("wall_clock_scale"),
         "started": doc.get("started"),
         "finished": doc.get("finished"),
@@ -246,9 +293,20 @@ def cmd_run(args: argparse.Namespace) -> None:
         raise SystemExit(f"--ctx-window must be above --reserve and at most {MAX_CTX_WINDOW}")
     if args.keep_tail < 0 or not 0 < args.threshold < 1:
         raise SystemExit("--keep-tail must be nonnegative and --threshold must be between 0 and 1")
-    wall_clock_scale = getattr(args, "wall_clock_scale", 1.0)
-    if not 0 < wall_clock_scale <= MAX_WALL_CLOCK_SCALE:
-        raise SystemExit(f"--wall-clock-scale must be above 0 and at most {MAX_WALL_CLOCK_SCALE}")
+    wall_clock_scale = getattr(args, "wall_clock_scale", None)
+    reference_path = getattr(args, "wall_clock_reference", None)
+    reference: dict | None = None
+    if reference_path is not None:
+        if wall_clock_scale is not None:
+            raise SystemExit("--wall-clock-scale and --wall-clock-reference are mutually exclusive")
+        reference = _load_wall_clock_reference(reference_path)
+    else:
+        if wall_clock_scale is None:
+            wall_clock_scale = 1.0
+        if not 0 < wall_clock_scale <= MAX_WALL_CLOCK_SCALE:
+            raise SystemExit(
+                f"--wall-clock-scale must be above 0 and at most {MAX_WALL_CLOCK_SCALE}"
+            )
     task_ids = args.tasks if args.tasks else [t.id for t in load_all()]
     base = (
         os.environ.get("OPENAI_BASE_URL", "http://localhost:8000/v1")
@@ -295,12 +353,30 @@ def cmd_run(args: argparse.Namespace) -> None:
         "compact": args.compact,
         "selected_tasks": task_ids,
         "trials": args.trials,
+        "wall_clock_scale_mode": "manual" if reference is None else "reference",
         "wall_clock_scale": wall_clock_scale,
         "started": datetime.now(UTC).isoformat(),
         "tasks": [],
     }
+    if reference is not None:
+        doc["wall_clock_reference"] = reference_path
+        doc["model_tps"] = None
     # Fail before spending model calls if the manifest cannot be recorded.
     _write_manifest(log_dir, doc, extra={"status": "running"})
+    model_tps: float | None = None
+    if reference is not None:
+        # One probe call measures generation speed; fail before the run starts.
+        try:
+            elapsed, _content, usage, err = _probe_once(client)
+        except Exception as exc:
+            elapsed, usage, err = 0.0, Usage(), str(exc) or type(exc).__name__
+        if err or usage.completion_tokens <= 0 or elapsed <= 0:
+            _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
+            reason = f"error: {err}" if err else f"{usage.completion_tokens} tokens"
+            raise SystemExit(f"wall-clock reference probe failed ({reason}); run not started")
+        model_tps = usage.completion_tokens / elapsed
+        doc["model_tps"] = model_tps
+        _write_manifest(log_dir, doc, extra={"status": "running"})
 
     def verify_source(completed_attempt: bool = False) -> None:
         current = _source_fingerprint()
@@ -322,6 +398,12 @@ def cmd_run(args: argparse.Namespace) -> None:
     for tid in task_ids:
         verify_source()
         task = load_task(tid)
+        task_scale = 1.0 if wall_clock_scale is None else wall_clock_scale
+        if reference is not None and model_tps is not None:
+            try:
+                task_scale = wall_clock_scale_for(reference, model_tps, task.tier)
+            except ValueError as exc:
+                raise SystemExit(f"--wall-clock-reference {reference_path}: {exc}") from None
         for trial in range(1, args.trials + 1):
             verify_source()
             project = f"rb-{task.id}-{trial}-{uuid.uuid4().hex[:6]}"
@@ -339,7 +421,8 @@ def cmd_run(args: argparse.Namespace) -> None:
                 threshold=args.threshold,
                 use_llm_compact=use_llm,
                 attacker_image=attacker_digest,
-                wall_clock_scale=wall_clock_scale,
+                wall_clock_scale=task_scale,
+                model_tps=model_tps,
             )
             usage = res.total_usage()
             solved = sorted(res.solved) == sorted(s.name for s in task.stages)
@@ -387,6 +470,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                     "compaction_cache_read_tokens": res.compaction_usage.cache_read_tokens,
                     "compaction_cache_write_tokens": res.compaction_usage.cache_write_tokens,
                     "wall_s": res.wall_s,
+                    "wall_clock_scale": task_scale,
                     "wall_clock_seconds": res.wall_clock_seconds,
                     "wall_clock_exceeded": res.wall_clock_exceeded,
                     "end_reason": res.end_reason,
@@ -468,7 +552,10 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_probe(args: argparse.Namespace) -> None:
-    """Send the probe prompt --samples times and print latency and tokens/sec per call."""
+    """Send the probe prompt --samples times and print latency and tokens/sec per call.
+
+    With --json, print one JSON summary object and nothing else.
+    """
     if args.samples < 1:
         raise SystemExit("--samples must be at least 1")
     base = args.base_url or os.environ.get("OPENAI_BASE_URL", "http://localhost:8000/v1")
@@ -487,27 +574,34 @@ def cmd_probe(args: argparse.Namespace) -> None:
             args.model,
             reasoning_effort=getattr(args, "reasoning_effort", None),
         )
+    as_json = getattr(args, "json", False)
     latencies: list[float] = []
     rates: list[float] = []
     for i in range(1, args.samples + 1):
-        start = time.perf_counter()
-        content, usage, err = client.chat(
-            [{"role": "user", "content": "Reply with exactly: COMMAND:\necho ok"}], 512
-        )
-        elapsed = time.perf_counter() - start
+        elapsed, content, usage, err = _probe_once(client)
         if err:
-            print(f"sample {i}: err={err}")
+            if not as_json:
+                print(f"sample {i}: err={err}")
             continue
         # completion_tokens already includes reasoning_tokens (see Usage.add).
         tokens = usage.completion_tokens
         tps = tokens / elapsed if elapsed > 0 else 0.0
-        print(
-            f"sample {i}: latency {elapsed:.2f}s tokens {tokens} "
-            f"(reasoning {usage.reasoning_tokens}) {tps:.1f} tok/s content={content!r}"
-        )
+        if not as_json:
+            print(
+                f"sample {i}: latency {elapsed:.2f}s tokens {tokens} "
+                f"(reasoning {usage.reasoning_tokens}) {tps:.1f} tok/s content={content!r}"
+            )
         latencies.append(elapsed)
         if tokens > 0 and elapsed > 0:
             rates.append(tps)
+    if as_json:
+        summary: dict[str, object] = {"samples": args.samples, "ok": len(latencies)}
+        if latencies:
+            summary["mean_latency_s"] = statistics.mean(latencies)
+            summary["median_latency_s"] = statistics.median(latencies)
+            summary["mean_tokens_per_sec"] = statistics.mean(rates) if rates else None
+        print(json.dumps(summary))
+        return
     if not latencies:
         return
     print(
@@ -582,9 +676,17 @@ def main() -> None:
     run.add_argument(
         "--wall-clock-scale",
         type=float,
-        default=1.0,
+        default=None,
         help="multiply each attempt's wall-clock cap so slow-inference models get "
-        f"proportionally more time for the same turn budget, at most {MAX_WALL_CLOCK_SCALE:g}",
+        f"proportionally more time for the same turn budget, default 1, "
+        f"at most {MAX_WALL_CLOCK_SCALE:g}",
+    )
+    run.add_argument(
+        "--wall-clock-reference",
+        default=None,
+        metavar="PATH",
+        help="reference JSON (reference_tps, tool_share_default, tool_share_by_tier); "
+        "probes the model once and scales each task's cap by its tier's generation share",
     )
     run.add_argument("--keep", action="store_true", help="skip teardown (debug)")
     run.add_argument(
@@ -628,6 +730,7 @@ def main() -> None:
     probe.add_argument(
         "--samples", type=int, default=1, help="sequential calls for latency and tokens/sec"
     )
+    probe.add_argument("--json", action="store_true", help="print one JSON summary object")
     probe.set_defaults(func=cmd_probe)
     pf = sub.add_parser("preflight", help="pull all images and check docker setup")
     pf.set_defaults(func=cmd_preflight)
