@@ -548,7 +548,11 @@ class WallClockReferenceTests(unittest.TestCase):
         self.assertEqual(config[0]["model_tps"], 50.0)
 
     def test_failed_probe_exits_before_run(self) -> None:
-        for usage, err in ((Usage(completion_tokens=50), "HTTP 500"), (Usage(), None)):
+        for usage, err in (
+            (Usage(completion_tokens=50), "HTTP 500"),
+            (Usage(), None),
+            (Usage(completion_tokens=50, requests=3), None),
+        ):
 
             class FailingClient:
                 def __init__(self, *_args: object, **_kwargs: object) -> None:

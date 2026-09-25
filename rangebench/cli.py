@@ -370,9 +370,14 @@ def cmd_run(args: argparse.Namespace) -> None:
             elapsed, _content, usage, err = _probe_once(client)
         except Exception as exc:
             elapsed, usage, err = 0.0, Usage(), str(exc) or type(exc).__name__
-        if err or usage.completion_tokens <= 0 or elapsed <= 0:
+        if err or usage.completion_tokens <= 0 or elapsed <= 0 or usage.requests > 1:
             _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
-            reason = f"error: {err}" if err else f"{usage.completion_tokens} tokens"
+            if err:
+                reason = f"error: {err}"
+            elif usage.requests > 1:
+                reason = f"{usage.requests} requests; retry backoff skews timing"
+            else:
+                reason = f"{usage.completion_tokens} tokens"
             raise SystemExit(f"wall-clock reference probe failed ({reason}); run not started")
         model_tps = usage.completion_tokens / elapsed
         doc["model_tps"] = model_tps
