@@ -711,7 +711,14 @@ def run_attempt(
     threshold: float = DEFAULT_THRESHOLD,
     use_llm_compact: bool = False,
     attacker_image: str = ATTACKER_IMAGE,
+    wall_clock_scale: float = 1.0,
 ) -> AttemptResult:
+    """Run one agent attempt against a live task env.
+
+    wall_clock_scale multiplies the resolved whole-attempt cap so a
+    slow-inference model gets proportionally more wall time for the same
+    turn budget; per-task caps and tier defaults stay untouched.
+    """
     ctx_window = min(ctx_window, MAX_CTX_WINDOW)
     res = AttemptResult(task_id=task.id, trial=trial, effective_ctx_window=ctx_window)
     env = TaskEnv(task, project, attacker_image)
@@ -722,6 +729,8 @@ def run_attempt(
     wall_clock = getattr(task, "wall_clock", None)
     if wall_clock is None:
         wall_clock = wall_clock_default(getattr(task, "tier", 1))
+    if wall_clock_scale != 1.0:
+        wall_clock = max(1, round(wall_clock * wall_clock_scale))
     res.wall_clock_seconds = wall_clock
     log_path = log_dir / f"{task.id}-t{trial}.jsonl"
     log_path.parent.mkdir(parents=True, exist_ok=True)

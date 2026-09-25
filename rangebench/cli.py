@@ -10,6 +10,7 @@ import math
 import os
 import statistics
 import subprocess
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +31,7 @@ from .runner import (
 )
 
 RESULTS = Path(__file__).resolve().parent.parent / "results"
+MAX_WALL_CLOCK_SCALE = 100.0
 
 
 def _wilson(p: float, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -148,6 +150,7 @@ def _write_manifest(log_dir: Path, doc: dict, extra: dict | None = None) -> None
         "compact": doc.get("compact"),
         "selected_tasks": doc.get("selected_tasks"),
         "trials": doc.get("trials"),
+        "wall_clock_scale": doc.get("wall_clock_scale"),
         "started": doc.get("started"),
         "finished": doc.get("finished"),
         "harness_commit": doc.get("harness_commit"),
@@ -243,6 +246,9 @@ def cmd_run(args: argparse.Namespace) -> None:
         raise SystemExit(f"--ctx-window must be above --reserve and at most {MAX_CTX_WINDOW}")
     if args.keep_tail < 0 or not 0 < args.threshold < 1:
         raise SystemExit("--keep-tail must be nonnegative and --threshold must be between 0 and 1")
+    wall_clock_scale = getattr(args, "wall_clock_scale", 1.0)
+    if not 0 < wall_clock_scale <= MAX_WALL_CLOCK_SCALE:
+        raise SystemExit(f"--wall-clock-scale must be above 0 and at most {MAX_WALL_CLOCK_SCALE}")
     task_ids = args.tasks if args.tasks else [t.id for t in load_all()]
     base = (
         os.environ.get("OPENAI_BASE_URL", "http://localhost:8000/v1")
@@ -289,6 +295,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         "compact": args.compact,
         "selected_tasks": task_ids,
         "trials": args.trials,
+        "wall_clock_scale": wall_clock_scale,
         "started": datetime.now(UTC).isoformat(),
         "tasks": [],
     }
@@ -332,6 +339,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 threshold=args.threshold,
                 use_llm_compact=use_llm,
                 attacker_image=attacker_digest,
+                wall_clock_scale=wall_clock_scale,
             )
             usage = res.total_usage()
             solved = sorted(res.solved) == sorted(s.name for s in task.stages)
@@ -460,6 +468,9 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_probe(args: argparse.Namespace) -> None:
+    """Send the probe prompt --samples times and print latency and tokens/sec per call."""
+    if args.samples < 1:
+        raise SystemExit("--samples must be at least 1")
     base = args.base_url or os.environ.get("OPENAI_BASE_URL", "http://localhost:8000/v1")
     provider = getattr(args, "provider", "openai")
     client: ChatClientProtocol
@@ -476,10 +487,35 @@ def cmd_probe(args: argparse.Namespace) -> None:
             args.model,
             reasoning_effort=getattr(args, "reasoning_effort", None),
         )
-    content, usage, err = client.chat(
-        [{"role": "user", "content": "Reply with exactly: COMMAND:\necho ok"}], 512
+    latencies: list[float] = []
+    rates: list[float] = []
+    for i in range(1, args.samples + 1):
+        start = time.perf_counter()
+        content, usage, err = client.chat(
+            [{"role": "user", "content": "Reply with exactly: COMMAND:\necho ok"}], 512
+        )
+        elapsed = time.perf_counter() - start
+        if err:
+            print(f"sample {i}: err={err}")
+            continue
+        # completion_tokens already includes reasoning_tokens (see Usage.add).
+        tokens = usage.completion_tokens
+        tps = tokens / elapsed if elapsed > 0 else 0.0
+        print(
+            f"sample {i}: latency {elapsed:.2f}s tokens {tokens} "
+            f"(reasoning {usage.reasoning_tokens}) {tps:.1f} tok/s content={content!r}"
+        )
+        latencies.append(elapsed)
+        if tokens > 0 and elapsed > 0:
+            rates.append(tps)
+    if not latencies:
+        return
+    print(
+        f"mean latency {statistics.mean(latencies):.2f}s "
+        f"median latency {statistics.median(latencies):.2f}s"
     )
-    print(f"err={err}\nusage={usage}\ncontent={content!r}")
+    mean_rate = f"{statistics.mean(rates):.1f}" if rates else "n/a"
+    print(f"mean tokens/sec {mean_rate} n={len(latencies)}/{args.samples}")
 
 
 def cmd_preflight(_args: argparse.Namespace) -> None:
@@ -543,6 +579,13 @@ def main() -> None:
     )
     run.add_argument("tasks", nargs="*")
     run.add_argument("--trials", type=int, default=1)
+    run.add_argument(
+        "--wall-clock-scale",
+        type=float,
+        default=1.0,
+        help="multiply each attempt's wall-clock cap so slow-inference models get "
+        f"proportionally more time for the same turn budget, at most {MAX_WALL_CLOCK_SCALE:g}",
+    )
     run.add_argument("--keep", action="store_true", help="skip teardown (debug)")
     run.add_argument(
         "--ctx-window",
@@ -582,6 +625,9 @@ def main() -> None:
     probe.add_argument("--base-url", default=None)
     probe.add_argument("--provider", choices=["openai", "anthropic"], default="openai")
     probe.add_argument("--reasoning-effort", default=None)
+    probe.add_argument(
+        "--samples", type=int, default=1, help="sequential calls for latency and tokens/sec"
+    )
     probe.set_defaults(func=cmd_probe)
     pf = sub.add_parser("preflight", help="pull all images and check docker setup")
     pf.set_defaults(func=cmd_preflight)
