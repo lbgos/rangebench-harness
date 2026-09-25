@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Local helper to drive rangebench environments by hand.
+#
+#   bench-remote up <task> <project>     bring up task env + attacker container
+#   bench-remote exec <project> "<cmd>"  run a bash command as agent in /work
+#   bench-remote down <project>          tear everything down
+#   bench-remote status <project>        show containers
+#
+# For remote hosts set REMOTE=user@host and REMOTE_DIR=/path/to/rangebench
+set -euo pipefail
+CMD="${1:-}"; shift || true
+REMOTE="${REMOTE:-}"
+REMOTE_DIR="${REMOTE_DIR:-~/rangebench}"
+
+run_local() { eval "$1"; }
+run_remote() { ssh "$REMOTE" "cd $REMOTE_DIR && $1"; }
+run() { if [[ -z "$REMOTE" ]]; then run_local "$1"; else run_remote "$1"; fi; }
+
+case "$CMD" in
+  up)
+    TASK="$1"; PROJ="$2"
+    PY=$(cat <<EOF
+from rangebench.env import load_task, TaskEnv
+t = load_task("$TASK")
+e = TaskEnv(t, "$PROJ")
+e.up()
+print("env-up project=$PROJ task=$TASK")
+for s in t.stages:
+    print("stage", s.name, s.service, s.flag_file)
+EOF
+)
+    if [[ -z "$REMOTE" ]]; then
+      printf '%s' "$PY" | python3 -
+    else
+      printf '%s' "$PY" | ssh "$REMOTE" "cd $REMOTE_DIR && python3 -"
+    fi
+    ;;
+  exec)
+    PROJ="$1"; CMDLINE="$2"
+    if [[ -z "$REMOTE" ]]; then
+      printf '%s' "$CMDLINE" | docker exec -i -u agent -w /work "$PROJ-atk" bash -s
+    else
+      printf '%s' "$CMDLINE" | ssh "$REMOTE" "docker exec -i -u agent -w /work $PROJ-atk bash -s"
+    fi
+    ;;
+  down)
+    PROJ="$1"
+    if [[ -z "$REMOTE" ]]; then
+      docker ps -a --filter label=com.docker.compose.project="$PROJ" -q | xargs -r docker rm -f >/dev/null 2>&1 || true
+      docker ps -a --filter name="$PROJ-atk" -q | xargs -r docker rm -f >/dev/null 2>&1 || true
+      for n in $(docker network ls --filter label=com.docker.compose.project="$PROJ" -q); do docker network rm "$n" >/dev/null 2>&1 || true; done
+      for v in $(docker volume ls --filter label=com.docker.compose.project="$PROJ" -q); do docker volume rm "$v" >/dev/null 2>&1 || true; done
+      docker volume rm "${PROJ}-pip-cache" >/dev/null 2>&1 || true
+      echo down-ok
+    else
+      ssh "$REMOTE" "docker ps -a --filter label=com.docker.compose.project=$PROJ -q | xargs -r docker rm -f >/dev/null 2>&1; docker ps -a --filter name=$PROJ-atk -q | xargs -r docker rm -f >/dev/null 2>&1; for n in \$(docker network ls --filter label=com.docker.compose.project=$PROJ -q); do docker network rm \$n >/dev/null 2>&1 || true; done; for v in \$(docker volume ls --filter label=com.docker.compose.project=$PROJ -q); do docker volume rm \$v >/dev/null 2>&1 || true; done; docker volume rm ${PROJ}-pip-cache >/dev/null 2>&1 || true; echo down-ok"
+    fi
+    ;;
+  status)
+    PROJ="$1"
+    run "docker ps -a --filter label=com.docker.compose.project=$PROJ --format 'table {{.Service}}\t{{.Status}}\t{{.Names}}'"
+    ;;
+  *)
+    echo "usage: bench-remote up|exec|down|status" >&2
+    exit 2
+    ;;
+esac
