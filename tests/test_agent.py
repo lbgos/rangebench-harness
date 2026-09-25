@@ -1,5 +1,6 @@
 import json
 import unittest
+import urllib.request
 from unittest.mock import patch
 
 from rangebench.agent import AnthropicChatClient, ChatClient, ChatResult, ResponseMetadata
@@ -44,6 +45,24 @@ class ResponseMetadataTests(unittest.TestCase):
         self.assertEqual(result.metadata, ResponseMetadata("length", True, True, 64))
         self.assertNotIn("private reasoning", repr(result))
         self.assertNotIn("secret", repr(result))
+
+    def test_reasoning_effort_is_sent_only_when_configured(self) -> None:
+        body = {
+            "choices": [{"finish_reason": "stop", "message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        }
+        payloads: list[dict] = []
+
+        def capture(req: urllib.request.Request, timeout: int | None = None) -> FakeResponse:
+            payloads.append(json.loads(req.data.decode()))
+            return FakeResponse(body)
+
+        with patch("rangebench.agent.urllib.request.urlopen", side_effect=capture):
+            ChatClient("http://localhost/v1", "k", "m").chat(self.messages, 64)
+            ChatClient("http://localhost/v1", "k", "m", reasoning_effort="max").chat(self.messages, 64)
+
+        self.assertNotIn("reasoning_effort", payloads[0])
+        self.assertEqual(payloads[1]["reasoning_effort"], "max")
 
     def test_openai_visible_reply_and_existing_tuple_interface(self) -> None:
         body = {

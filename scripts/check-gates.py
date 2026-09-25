@@ -10,8 +10,7 @@ Checks every tasks/<id> directory that ships a task.json:
 4. No literal flag material outside solution/: flags are generated inside the
    target at boot, so any flag{...} literal whose body is not a shell or
    compose command substitution (flag{$(...)} / flag{$$(...)}) is static and
-   must be allowlisted in the task's .audit/allow-static-flags.txt. The
-   allowlist exists for the intentional git-bounty decoy.
+   must be allowlisted in the task's .audit/allow-static-flags.txt.
 5. The per-task identity from rangebench/identity.py is computable.
 
 Prints one GATE-FAIL line per finding and exits nonzero when any gate fails.

@@ -251,11 +251,21 @@ class ChatResultClientProtocol(ChatClientProtocol, Protocol):
 
 
 class ChatClient:
-    def __init__(self, base_url: str, api_key: str, model: str, timeout: int = 600):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout: int = 600,
+        reasoning_effort: str | None = None,
+    ):
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        # OpenAI-compatible reasoning knob (e.g. low/medium/high/max); sent
+        # only when configured so providers without support stay unaffected.
+        self.reasoning_effort = reasoning_effort
 
     def chat(
         self, messages: list[dict], max_tokens: int, temperature: float = 0.2
@@ -274,6 +284,8 @@ class ChatClient:
             "temperature": temperature,
             "stream": False,
         }
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         req = urllib.request.Request(
             self.url,
             data=json.dumps(payload).encode(),

@@ -18,6 +18,8 @@ ATTACKER_IMAGE = "rb-attacker:latest"
 # Linux limits each argv string to 128 KiB including its terminator. Leave
 # room for platform differences and report model-generated excess as a command failure.
 MAX_COMMAND_BYTES = 120_000
+# Oversized observations are saved here inside the attacker for later paging.
+OBS_DIR = "/work/obs"
 COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
 # Docker's inspect API has added and removed non-image Config fields across versions.
 # Keep the fields that belong to the image configuration.
@@ -196,6 +198,7 @@ class TaskEnv:
         self.attacker_image = attacker_image
         self.service_image_ids: dict[str, str] = {}
         self.service_image_fingerprints: dict[str, str] = {}
+        self.saved_outputs = 0
 
     def up(self, build: bool = True) -> None:
         compose = [
@@ -484,6 +487,39 @@ class TaskEnv:
             if exc.errno == errno.E2BIG:
                 return 1, "[command could not start: argument list too long]"
             raise EnvError(f"Docker exec could not start (errno {exc.errno})") from exc
+
+    def save_output(self, content: str) -> str:
+        """Write full command output into the attacker at /work/obs/NNNN.log, return the path.
+
+        Content goes over stdin so size never touches argv. Raises EnvError on failure.
+        """
+        self.saved_outputs += 1
+        path = f"{OBS_DIR}/{self.saved_outputs:04d}.log"
+        try:
+            proc = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    "-i",
+                    "-u",
+                    "agent",
+                    self.attacker,
+                    "sh",
+                    "-c",
+                    f"mkdir -p {OBS_DIR} && cat > {path}",
+                ],
+                input=content.encode("utf-8", "surrogatepass"),
+                capture_output=True,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise EnvError("saving command output timed out") from exc
+        except OSError as exc:
+            raise EnvError(f"saving command output could not start (errno {exc.errno})") from exc
+        if proc.returncode != 0:
+            stderr = proc.stderr.decode("utf-8", "replace")[-300:]
+            raise EnvError(f"saving command output failed: {stderr}")
+        return path
 
     def read_flag(self, stage: Stage) -> str:
         compose = [

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from rangebench.agent import ChatResult, ResponseMetadata, Usage
-from rangebench.env import ATTACKER_IMAGE, EnvError, Stage, Task, TaskEnv, load_all
+from rangebench.env import ATTACKER_IMAGE, EnvError, Stage, Task, TaskEnv, load_all, truncate_output
 from rangebench.runner import run_attempt, run_oracle
 
 
@@ -143,6 +143,98 @@ class RunnerTests(unittest.TestCase):
             "[command contains invalid UTF-8]",
         )
         run.assert_not_called()
+
+    def _run_with_output(self, output: str, save_fails: bool = False) -> tuple[list[dict], list[dict], list[str]]:
+        """Run one command turn returning `output`; return (log records, messages, saved)."""
+        saved: list[str] = []
+        seen: list[list[dict]] = []
+
+        class OutputEnv(FakeEnv):
+            def exec(self, cmd: str, **_kwargs: object) -> tuple[int, str]:
+                return 0, output
+
+            def save_output(self, content: str) -> str:
+                if save_fails:
+                    raise EnvError("container gone")
+                saved.append(content)
+                return f"/work/obs/{len(saved):04d}.log"
+
+        class CommandThenAnswer:
+            def chat(self, messages: list[dict], max_tokens: int, temperature: float = 0.2) -> tuple[str, Usage, None]:
+                seen.append(list(messages))
+                content = "COMMAND:\ncat big" if len(seen) == 1 else "ANSWER: flag{test}"
+                return content, Usage(prompt_tokens=20, completion_tokens=10), None
+
+        with tempfile.TemporaryDirectory() as tmp, patch("rangebench.runner.TaskEnv", OutputEnv):
+            task = Task("sample", Path(tmp), "web", 1, "Find the flag", stages=[Stage("one", "/flag", "target")])
+            result = run_attempt(CommandThenAnswer(), task, 1, "rb-test", Path(tmp), verbose=False)
+            records = [json.loads(line) for line in (Path(tmp) / "sample-t1.jsonl").read_text().splitlines()]
+        self.assertEqual(result.end_reason, "all stages captured")
+        return records, seen[-1], saved
+
+    def test_short_output_is_not_paged(self) -> None:
+        output = "\n".join(f"line {i}" for i in range(400)) + "\n"
+        records, messages, saved = self._run_with_output(output)
+        self.assertEqual(saved, [])
+        exec_rec = next(r for r in records if r["kind"] == "exec")
+        self.assertNotIn("pager", exec_rec)
+        self.assertEqual(exec_rec["out"], truncate_output(output))
+        self.assertEqual(messages[-1]["content"], f"OBSERVATION (exit 0):\n{truncate_output(output)}")
+
+    def test_threshold_boundary_counts_final_line_without_newline(self) -> None:
+        output = "\n".join(f"line {i}" for i in range(401))
+        self.assertEqual(output.count("\n"), 400)  # old threshold would skip it
+        records, _messages, saved = self._run_with_output(output)
+        self.assertEqual(saved, [output])
+        exec_rec = next(r for r in records if r["kind"] == "exec")
+        self.assertEqual(exec_rec["pager"], {"path": "/work/obs/0001.log", "lines": 401})
+
+    def test_long_output_is_saved_and_previewed(self) -> None:
+        output = "\n".join(f"line {i}" for i in range(1, 1001)) + "\n"
+        records, messages, saved = self._run_with_output(output)
+        self.assertEqual(saved, [output])
+        exec_rec = next(r for r in records if r["kind"] == "exec")
+        self.assertEqual(exec_rec["pager"], {"path": "/work/obs/0001.log", "lines": 1000})
+        self.assertNotIn("line 500\n", exec_rec["out"])
+        obs = messages[-1]["content"].removeprefix("OBSERVATION (exit 0):\n")
+        self.assertEqual(obs, exec_rec["out"])
+        lines = obs.split("\n")
+        self.assertEqual(len(lines), 120 + 1 + 40)
+        self.assertEqual(lines[:120], [f"line {i}" for i in range(1, 121)])
+        self.assertEqual(lines[121:], [f"line {i}" for i in range(961, 1001)])
+        self.assertIn("840 lines omitted", lines[120])
+        self.assertIn("sed -n '121,960p' /work/obs/0001.log", lines[120])
+
+    def test_long_wide_output_preview_stays_bounded(self) -> None:
+        output = "\n".join("x" * 500 for _ in range(1000))
+        records, _messages, saved = self._run_with_output(output)
+        exec_rec = next(r for r in records if r["kind"] == "exec")
+        self.assertEqual(len(saved), 1)
+        self.assertLessEqual(len(exec_rec["out"]), 6000)
+        self.assertIn("/work/obs/0001.log", exec_rec["out"])
+
+    def test_pager_save_failure_falls_back_to_truncate(self) -> None:
+        output = "\n".join(f"line {i}" for i in range(1000))
+        records, messages, _saved = self._run_with_output(output, save_fails=True)
+        failed = next(r for r in records if r["kind"] == "pager-save-failed")
+        self.assertIn("container gone", failed["error"])
+        exec_rec = next(r for r in records if r["kind"] == "exec")
+        self.assertNotIn("pager", exec_rec)
+        self.assertEqual(exec_rec["out"], truncate_output(output))
+        self.assertEqual(messages[-1]["content"], f"OBSERVATION (exit 0):\n{truncate_output(output)}")
+
+    def test_save_output_pipes_content_over_stdin(self) -> None:
+        task = Task("sample", Path("/tmp"), "web", 1, "Find the flag")
+        env = TaskEnv(task, "rb-test")
+        ok = SimpleNamespace(returncode=0, stderr=b"")
+        with patch("rangebench.env.subprocess.run", return_value=ok) as run:
+            first = env.save_output("big \udcff output")
+            second = env.save_output("more")
+        self.assertEqual((first, second), ("/work/obs/0001.log", "/work/obs/0002.log"))
+        argv = run.call_args_list[0].args[0]
+        self.assertEqual(argv[:3], ["docker", "exec", "-i"])
+        self.assertNotIn("big", " ".join(argv))
+        self.assertEqual(run.call_args_list[0].kwargs["input"], "big \udcff output".encode("utf-8", "surrogatepass"))
 
     def test_keep_writes_event_before_closing_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch("rangebench.runner.TaskEnv", FakeEnv):

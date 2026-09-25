@@ -23,6 +23,13 @@ from .env import ATTACKER_IMAGE, EnvError, Task, TaskEnv, truncate_output, wall_
 
 WRONG_LIMIT = 3
 
+# Observations over PAGER_LINES lines are saved in the attacker and shown as a
+# head/tail preview pointing at the saved file.
+PAGER_LINES = 400
+PAGER_HEAD = 120
+PAGER_TAIL = 40
+PAGER_CHARS = 6000
+
 # Supplemental end-reason taxonomy. Reporting only: it never changes the
 # scored field, denominators, or exit behavior. Unknown endings classify as
 # normal so a future reason stays in the scored denominator by default.
@@ -656,6 +663,40 @@ def _is_output_limit_error(error: str) -> bool:
     ) and any(marker in lower for marker in ("exceed", "too large", "maximum", "limit", "must be"))
 
 
+def pager_preview(out: str, path: str) -> str:
+    """Head/tail preview of an oversized observation, pointing at its saved copy."""
+    # Split on \n only so line numbers match what sed sees in the saved file.
+    lines = out.removesuffix("\n").split("\n")
+    first, last = PAGER_HEAD + 1, len(lines) - PAGER_TAIL
+    head = "\n".join(lines[:PAGER_HEAD])
+    tail = "\n".join(lines[-PAGER_TAIL:])
+    marker = (
+        f"...[{last - first + 1} lines omitted, full output saved to {path}"
+        f" — use sed -n '{first},{last}p' {path} to inspect]..."
+    )
+    if len(head) + len(tail) + len(marker) + 2 > PAGER_CHARS:
+        room = PAGER_CHARS - len(marker) - 100
+        head = truncate_output(head, room * 3 // 5)
+        tail = truncate_output(tail, room * 2 // 5)
+    return f"{head}\n{marker}\n{tail}"
+
+
+def _observation(
+    env: TaskEnv, out: str, emit: Callable[..., None]
+) -> tuple[str, dict[str, Any] | None]:
+    """Model-facing observation plus pager info when the output was saved for paging."""
+    # Physical lines, matching sed: a final line without a newline still counts.
+    lines = out.removesuffix("\n").count("\n") + 1
+    if lines <= PAGER_LINES:
+        return truncate_output(out), None
+    try:
+        path = env.save_output(out)
+    except Exception as exc:
+        emit("pager-save-failed", error=str(exc)[:300])
+        return truncate_output(out), None
+    return pager_preview(out, path), {"path": path, "lines": lines}
+
+
 def run_attempt(
     client: ChatClientProtocol,
     task: Task,
@@ -929,8 +970,14 @@ def run_attempt(
                     emit("fatal", reason=res.end_reason)
                     break
                 res.commands += 1
-                obs = truncate_output(out)
-                emit("exec", cmd=cmd[:2000], rc=rc, out=obs[:8000])
+                obs, pager = _observation(env, out, emit)
+                emit(
+                    "exec",
+                    cmd=cmd[:2000],
+                    rc=rc,
+                    out=obs[:8000],
+                    **({"pager": pager} if pager else {}),
+                )
                 messages.append({"role": "assistant", "content": content[:4000]})
                 messages.append({"role": "user", "content": f"OBSERVATION (exit {rc}):\n{obs}"})
             else:

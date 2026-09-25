@@ -41,6 +41,38 @@ def _wilson(p: float, n: int, z: float = 1.96) -> tuple[float, float]:
     return max(0.0, (centre - delta) / denom), min(1.0, (centre + delta) / denom)
 
 
+def pass_at_k(n: int, c: int, k: int) -> float:
+    """Unbiased pass@k from n trials with c solved: 1 - C(n-c, k) / C(n, k)."""
+    if c <= 0 or k <= 0 or k > n:
+        return 0.0
+    return 1.0 - math.comb(n - c, k) / math.comb(n, k)
+
+
+def _print_pass_at_k(attempts: list[dict], trials: int) -> None:
+    """Print per-task pass@1..3 and overall means over scored attempts only.
+
+    A task enters the pass@k mean only if it has at least k scored attempts.
+    """
+    counts: dict[str, list[int]] = {}
+    for t in attempts:
+        if t["scored"]:
+            n_c = counts.setdefault(t["task"], [0, 0])
+            n_c[0] += 1
+            n_c[1] += int(t["solved"])
+    ks = range(1, min(3, trials) + 1)
+    print("\npass@k (scored attempts only):")
+    for tid, (n, c) in counts.items():
+        cols = " ".join(f"pass@{k}={pass_at_k(n, c, k):.2%}" for k in ks if k <= n)
+        print(f"  {tid:20} {c}/{n} {cols}")
+    for k in sorted({ks[-1], 1}, reverse=True):
+        scores = [pass_at_k(n, c, k) for n, c in counts.values() if n >= k]
+        if not scores:
+            continue
+        mean = statistics.mean(scores)
+        lo, hi = _wilson(mean, len(scores))
+        print(f"overall pass@{k}: {mean:.2%} [{lo:.2%}, {hi:.2%}] mean over {len(scores)} tasks")
+
+
 def _get_git_commit() -> str | None:
     for cmd in (["git", "rev-parse", "HEAD"], ["git", "rev-parse", "--short", "HEAD"]):
         try:
@@ -237,6 +269,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             base_url=base,
             api_key=os.environ.get("OPENAI_API_KEY", "dummy"),
             model=args.model,
+            reasoning_effort=getattr(args, "reasoning_effort", None),
         )
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
     log_dir = RESULTS / run_id
@@ -409,6 +442,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         p = solved_count / total if total else 0
         lo, hi = _wilson(p, total)
         print(f"overall Wilson 95%: {p:.2%} [{lo:.2%}, {hi:.2%}] n={total}")
+        _print_pass_at_k(doc["tasks"], args.trials)
     toks = [t["completion_tokens"] for t in doc["tasks"]]
     if toks:
         print(
@@ -436,7 +470,12 @@ def cmd_probe(args: argparse.Namespace) -> None:
             args.model,
         )
     else:
-        client = ChatClient(base, os.environ.get("OPENAI_API_KEY", "dummy"), args.model)
+        client = ChatClient(
+            base,
+            os.environ.get("OPENAI_API_KEY", "dummy"),
+            args.model,
+            reasoning_effort=getattr(args, "reasoning_effort", None),
+        )
     content, usage, err = client.chat(
         [{"role": "user", "content": "Reply with exactly: COMMAND:\necho ok"}], 512
     )
@@ -532,11 +571,17 @@ def main() -> None:
         default="llm",
         help="compaction mode, same-model llm is the default",
     )
+    run.add_argument(
+        "--reasoning-effort",
+        default=None,
+        help="openai-compatible reasoning effort knob sent to the provider (e.g. high, max)",
+    )
     run.set_defaults(func=cmd_run)
     probe = sub.add_parser("probe")
     probe.add_argument("--model", required=True)
     probe.add_argument("--base-url", default=None)
     probe.add_argument("--provider", choices=["openai", "anthropic"], default="openai")
+    probe.add_argument("--reasoning-effort", default=None)
     probe.set_defaults(func=cmd_probe)
     pf = sub.add_parser("preflight", help="pull all images and check docker setup")
     pf.set_defaults(func=cmd_preflight)
