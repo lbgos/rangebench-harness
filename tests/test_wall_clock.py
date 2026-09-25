@@ -8,9 +8,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rangebench.agent import Usage
-from rangebench.cli import cmd_probe, cmd_run
+from rangebench.cli import cmd_probe, cmd_run, main
 from rangebench.env import ATTACKER_IMAGE, EnvError, Stage, Task, load_task, wall_clock_default
-from rangebench.runner import AttemptResult, run_attempt
+from rangebench.runner import AttemptResult, run_attempt, wall_clock_scale_for
 
 
 class FakeEnv:
@@ -383,6 +383,222 @@ class WallClockTests(unittest.TestCase):
         self.assertEqual(manifest["wall_clock_scale"], 2.5)
 
 
+REFERENCE = {
+    "reference_tps": 100.0,
+    "tool_share_default": 0.55,
+    "tool_share_by_tier": {"1": 0.5, "3": 0.6},
+}
+
+
+class WallClockReferenceTests(unittest.TestCase):
+    def test_scale_formula(self) -> None:
+        # tier 1: 0.5 + 0.5 * 100/50 = 1.5; tier 3: 0.6 + 0.4 * 100/200 = 0.8
+        self.assertAlmostEqual(wall_clock_scale_for(REFERENCE, 50.0, 1), 1.5)
+        self.assertAlmostEqual(wall_clock_scale_for(REFERENCE, 200.0, 3), 0.8)
+        self.assertAlmostEqual(wall_clock_scale_for(REFERENCE, 100.0, 3), 1.0)
+
+    def test_default_share_when_tier_missing(self) -> None:
+        # tier 5 is absent: 0.55 + 0.45 * 100/25 = 2.35
+        self.assertAlmostEqual(wall_clock_scale_for(REFERENCE, 25.0, 5), 2.35)
+        no_tiers = {"reference_tps": 100.0, "tool_share_default": 0.25, "tool_share_by_tier": {}}
+        self.assertAlmostEqual(wall_clock_scale_for(no_tiers, 50.0, 1), 1.75)
+
+    def test_clamped_to_max(self) -> None:
+        self.assertEqual(wall_clock_scale_for(REFERENCE, 0.001, 1), 100.0)
+
+    def test_non_positive_tps_raises(self) -> None:
+        for model_tps in (0.0, -5.0):
+            with self.subTest(model_tps=model_tps), self.assertRaisesRegex(ValueError, "model"):
+                wall_clock_scale_for(REFERENCE, model_tps, 1)
+        for reference_tps in (0.0, -1.0):
+            bad = dict(REFERENCE, reference_tps=reference_tps)
+            with (
+                self.subTest(reference_tps=reference_tps),
+                self.assertRaisesRegex(ValueError, "reference_tps"),
+            ):
+                wall_clock_scale_for(bad, 50.0, 1)
+
+    def _args(self, **overrides: object) -> argparse.Namespace:
+        args = argparse.Namespace(
+            trials=1,
+            ctx_window=128000,
+            reserve=12000,
+            keep_tail=12,
+            threshold=0.82,
+            tasks=["sample"],
+            base_url="http://localhost:8000/v1",
+            provider="openai",
+            model="test",
+            compact="deterministic",
+            keep=False,
+            wall_clock_scale=None,
+            wall_clock_reference=None,
+        )
+        vars(args).update(overrides)
+        return args
+
+    def _write_reference(self, tmp: str, content: object) -> str:
+        path = Path(tmp) / "reference.json"
+        path.write_text(content if isinstance(content, str) else json.dumps(content))
+        return str(path)
+
+    def test_scale_and_reference_are_mutually_exclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_reference(tmp, REFERENCE)
+            with (
+                patch("rangebench.cli.ChatClient", NoCallsClient),
+                self.assertRaisesRegex(SystemExit, "mutually exclusive"),
+            ):
+                cmd_run(self._args(wall_clock_scale=2.0, wall_clock_reference=path))
+
+    def test_parser_accepts_flags_and_rejects_both(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_reference(tmp, REFERENCE)
+            argv = ["rangebench", "run", "--model", "m", "--wall-clock-scale", "2"]
+            argv += ["--wall-clock-reference", path]
+            with (
+                patch("sys.argv", argv),
+                patch("rangebench.cli.ChatClient", NoCallsClient),
+                self.assertRaisesRegex(SystemExit, "mutually exclusive"),
+            ):
+                main()
+
+    def test_reference_file_validation(self) -> None:
+        cases: list[tuple[str, object, str]] = [
+            ("missing", None, "not found"),
+            ("bad json", "{not json", "JSON"),
+            ("not object", [1, 2], "JSON object"),
+            ("zero tps", dict(REFERENCE, reference_tps=0), "reference_tps"),
+            ("negative tps", dict(REFERENCE, reference_tps=-3.0), "reference_tps"),
+            ("no default", {"reference_tps": 50.0}, "tool_share_default"),
+            ("bad default", dict(REFERENCE, tool_share_default=1.5), "tool_share_default"),
+            ("bad tier", dict(REFERENCE, tool_share_by_tier={"2": "x"}), "tool_share_by_tier"),
+        ]
+        for name, content, message in cases:
+            with (
+                self.subTest(name),
+                tempfile.TemporaryDirectory() as tmp,
+                patch("rangebench.cli.ChatClient", NoCallsClient),
+                self.assertRaisesRegex(SystemExit, message),
+            ):
+                path = (
+                    str(Path(tmp) / "absent.json")
+                    if content is None
+                    else self._write_reference(tmp, content)
+                )
+                cmd_run(self._args(wall_clock_reference=path))
+
+    def test_reference_run_scales_cap_per_task(self) -> None:
+        calls: list[int] = []
+
+        class CountingClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def chat(
+                self, _messages: list[dict], max_tokens: int, temperature: float = 0.2
+            ) -> tuple[str, Usage, None]:
+                calls.append(max_tokens)
+                return "COMMAND:\ntrue", Usage(completion_tokens=50), None
+
+        clock = iter([10.0, 11.0])  # the startup probe takes 1s: 50 tok/s
+        with tempfile.TemporaryDirectory() as tmp:
+            task = Task(
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+                turns=1,
+                wall_clock=30,
+            )
+            path = self._write_reference(tmp, REFERENCE)
+            with (
+                patch("rangebench.cli.RESULTS", Path(tmp)),
+                patch("rangebench.cli.load_task", return_value=task),
+                patch("rangebench.cli.ChatClient", CountingClient),
+                patch("rangebench.runner.TaskEnv", FakeEnv),
+                patch("rangebench.cli.time.perf_counter", side_effect=lambda: next(clock)),
+                patch("rangebench.cli._get_attacker_digest", return_value="sha256:test"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                cmd_run(self._args(wall_clock_reference=path))
+            saved = json.loads((Path(tmp) / "latest.json").read_text())
+            manifest = json.loads(next(Path(tmp).glob("*/manifest.json")).read_text())
+            records = [
+                json.loads(line)
+                for line in next(Path(tmp).glob("*/sample-t1.jsonl")).read_text().splitlines()
+            ]
+        # One startup probe call plus the single agent turn.
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], 512)
+        # tier 1 share 0.5: 0.5 + 0.5 * 100/50 = 1.5, so the 30s cap becomes 45s.
+        self.assertEqual(saved["tasks"][0]["wall_clock_scale"], 1.5)
+        self.assertEqual(saved["model_tps"], 50.0)
+        self.assertEqual(saved["wall_clock_reference"], path)
+        self.assertEqual(saved["wall_clock_scale_mode"], "reference")
+        self.assertEqual(manifest["wall_clock_reference"], path)
+        end = next(r for r in records if r["kind"] == "end")
+        self.assertEqual(end["wall_clock_seconds"], 45)
+        config = [r for r in records if r["kind"] == "budget-config"]
+        self.assertEqual(len(config), 1)
+        self.assertEqual(config[0]["tier"], 1)
+        self.assertEqual(config[0]["wall_clock_scale"], 1.5)
+        self.assertEqual(config[0]["model_tps"], 50.0)
+
+    def test_failed_probe_exits_before_run(self) -> None:
+        for usage, err in (
+            (Usage(completion_tokens=50), "HTTP 500"),
+            (Usage(), None),
+            (Usage(completion_tokens=50, requests=3), None),
+        ):
+
+            class FailingClient:
+                def __init__(self, *_args: object, **_kwargs: object) -> None:
+                    pass
+
+                def chat(self, *_args: object, **_kwargs: object) -> tuple[str, Usage, str | None]:
+                    return "", usage, err
+
+            with (
+                self.subTest(err=err),
+                tempfile.TemporaryDirectory() as tmp,
+                patch("rangebench.cli.RESULTS", Path(tmp)),
+                patch("rangebench.cli.ChatClient", FailingClient),
+                patch("rangebench.cli.run_attempt") as attempt,
+                patch("rangebench.cli._get_attacker_digest", return_value="sha256:test"),
+            ):
+                path = self._write_reference(tmp, REFERENCE)
+                with self.assertRaisesRegex(SystemExit, "probe failed"):
+                    cmd_run(self._args(wall_clock_reference=path))
+                manifest = json.loads(next(Path(tmp).glob("*/manifest.json")).read_text())
+                attempt.assert_not_called()
+                self.assertEqual(manifest["status"], "probe_failed")
+
+    def test_manual_mode_recorded(self) -> None:
+        task = Task(
+            "sample", Path("/tmp"), "web", 1, "Find the flag", stages=[Stage("one", "/flag", "web")]
+        )
+        result = AttemptResult(task.id, 1, end_reason="solved")
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch("rangebench.cli.RESULTS", Path(tmp)),
+                patch("rangebench.cli.load_task", return_value=task),
+                patch("rangebench.cli.ChatClient") as client_cls,
+                patch("rangebench.cli.run_attempt", return_value=result),
+                patch("rangebench.cli._get_attacker_digest", return_value="sha256:test"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                cmd_run(self._args(wall_clock_scale=2.0))
+            saved = json.loads((Path(tmp) / "latest.json").read_text())
+        client_cls.return_value.chat.assert_not_called()  # no startup probe in manual mode
+        self.assertEqual(saved["wall_clock_scale_mode"], "manual")
+        self.assertEqual(saved["wall_clock_scale"], 2.0)
+        self.assertEqual(saved["tasks"][0]["wall_clock_scale"], 2.0)
+        self.assertNotIn("model_tps", saved)
+
+
 class ProbeTests(unittest.TestCase):
     def test_samples_report_throughput(self) -> None:
         calls: list[int] = []
@@ -410,6 +626,60 @@ class ProbeTests(unittest.TestCase):
         self.assertIn("sample 2: latency 1.00s tokens 50 (reasoning 20) 50.0 tok/s", text)
         self.assertIn("mean latency 1.83s median latency 2.00s", text)
         self.assertIn("mean tokens/sec 31.7 n=3/3", text)
+
+    def test_json_summary(self) -> None:
+        replies = iter([(Usage(completion_tokens=50), None), (Usage(), "HTTP 500")] * 2)
+
+        class MixedClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def chat(self, _messages: list[dict], max_tokens: int) -> tuple[str, Usage, str | None]:
+                usage, err = next(replies)
+                return "COMMAND:\necho ok", usage, err
+
+        args = argparse.Namespace(
+            model="test", base_url=None, provider="openai", reasoning_effort=None, samples=3
+        )
+        args.json = True
+        # samples: 2.0s ok, 1.0s error, 3.0s ok
+        clock = iter([0.0, 2.0, 10.0, 11.0, 20.0, 23.0])
+        with (
+            patch("rangebench.cli.ChatClient", MixedClient),
+            patch("rangebench.cli.time.perf_counter", side_effect=lambda: next(clock)),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            cmd_probe(args)
+        self.assertEqual(
+            json.loads(out.getvalue()),
+            {
+                "samples": 3,
+                "ok": 2,
+                "mean_latency_s": 2.5,
+                "median_latency_s": 2.5,
+                "mean_tokens_per_sec": (25.0 + 50.0 / 3.0) / 2,
+            },
+        )
+        self.assertEqual(len(out.getvalue().strip().splitlines()), 1)
+
+    def test_json_all_failed(self) -> None:
+        class FailingClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def chat(self, _messages: list[dict], max_tokens: int) -> tuple[str, Usage, str]:
+                return "", Usage(), "HTTP 500"
+
+        args = argparse.Namespace(
+            model="test", base_url=None, provider="openai", reasoning_effort=None, samples=2
+        )
+        args.json = True
+        with (
+            patch("rangebench.cli.ChatClient", FailingClient),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            cmd_probe(args)
+        self.assertEqual(json.loads(out.getvalue()), {"samples": 2, "ok": 0})
 
 
 if __name__ == "__main__":

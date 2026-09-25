@@ -295,7 +295,10 @@ class RunSummaryTests(unittest.TestCase):
             saved = json.loads((Path(tmp) / "latest.json").read_text())["tasks"][0]
             output = stdout.getvalue()
 
-        self.assertEqual(set(saved), self.PREEXISTING_FIELDS | {"fail_class", "refusals"})
+        self.assertEqual(
+            set(saved),
+            self.PREEXISTING_FIELDS | {"fail_class", "refusals", "wall_clock_scale"},
+        )
         self.assertEqual(saved["fail_class"], FAIL_BUDGET)
         self.assertEqual(saved["refusals"], 2)
         self.assertTrue(saved["scored"])
