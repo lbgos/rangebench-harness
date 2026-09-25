@@ -1,4 +1,6 @@
 import argparse
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -6,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rangebench.agent import Usage
-from rangebench.cli import cmd_run
+from rangebench.cli import cmd_probe, cmd_run
 from rangebench.env import ATTACKER_IMAGE, EnvError, Stage, Task, load_task, wall_clock_default
 from rangebench.runner import AttemptResult, run_attempt
 
@@ -301,6 +303,113 @@ class WallClockTests(unittest.TestCase):
         # Existing summary fields are unchanged.
         self.assertEqual(saved["wall_s"], result.wall_s)
         self.assertEqual(saved["turns_used"], result.turns_used)
+
+    def test_scale_multiplies_resolved_cap(self) -> None:
+        for scale, expected in ((2.0, 60), (1.0, 30), (0.001, 1)):
+            with (
+                self.subTest(scale=scale),
+                tempfile.TemporaryDirectory() as tmp,
+                patch("rangebench.runner.TaskEnv", FakeEnv),
+            ):
+                task = Task(
+                    "sample",
+                    Path(tmp),
+                    "web",
+                    1,
+                    "Find the flag",
+                    stages=[Stage("one", "/flag", "target")],
+                    turns=1,
+                    wall_clock=30,
+                )
+                result = run_attempt(
+                    LoopClient(),
+                    task,
+                    1,
+                    "rb-test",
+                    Path(tmp),
+                    verbose=False,
+                    wall_clock_scale=scale,
+                )
+                records = [
+                    json.loads(line)
+                    for line in (Path(tmp) / "sample-t1.jsonl").read_text().splitlines()
+                ]
+                self.assertEqual(result.wall_clock_seconds, expected)
+                end = next(r for r in records if r["kind"] == "end")
+                self.assertEqual(end["wall_clock_seconds"], expected)
+
+    def _run_args(self, **overrides: object) -> argparse.Namespace:
+        args = argparse.Namespace(
+            trials=1,
+            ctx_window=128000,
+            reserve=12000,
+            keep_tail=12,
+            threshold=0.82,
+            tasks=["sample"],
+            base_url="http://localhost:8000/v1",
+            provider="openai",
+            model="test",
+            compact="deterministic",
+            keep=False,
+            wall_clock_scale=1.0,
+        )
+        vars(args).update(overrides)
+        return args
+
+    def test_scale_validation(self) -> None:
+        for scale in (0.0, -1.0, 100.5):
+            with self.subTest(scale=scale), self.assertRaisesRegex(SystemExit, "wall-clock-scale"):
+                cmd_run(self._run_args(wall_clock_scale=scale))
+
+    def test_scale_recorded_in_doc_and_manifest(self) -> None:
+        task = Task(
+            "sample", Path("/tmp"), "web", 1, "Find the flag", stages=[Stage("one", "/flag", "web")]
+        )
+        result = AttemptResult(task.id, 1, end_reason="solved")
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch("rangebench.cli.RESULTS", Path(tmp)),
+                patch("rangebench.cli.load_task", return_value=task),
+                patch("rangebench.cli.ChatClient"),
+                patch("rangebench.cli.run_attempt", return_value=result) as attempt,
+                patch("rangebench.cli._get_attacker_digest", return_value="sha256:test"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                cmd_run(self._run_args(wall_clock_scale=2.5))
+            saved = json.loads((Path(tmp) / "latest.json").read_text())
+            manifest = json.loads(next(Path(tmp).glob("*/manifest.json")).read_text())
+        self.assertEqual(attempt.call_args.kwargs["wall_clock_scale"], 2.5)
+        self.assertEqual(saved["wall_clock_scale"], 2.5)
+        self.assertEqual(manifest["wall_clock_scale"], 2.5)
+
+
+class ProbeTests(unittest.TestCase):
+    def test_samples_report_throughput(self) -> None:
+        calls: list[int] = []
+
+        class FixedClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def chat(self, _messages: list[dict], max_tokens: int) -> tuple[str, Usage, None]:
+                calls.append(max_tokens)
+                return "COMMAND:\necho ok", Usage(completion_tokens=50, reasoning_tokens=20), None
+
+        args = argparse.Namespace(
+            model="test", base_url=None, provider="openai", reasoning_effort=None, samples=3
+        )
+        clock = iter([0.0, 2.0, 10.0, 11.0, 20.0, 22.5])
+        with (
+            patch("rangebench.cli.ChatClient", FixedClient),
+            patch("rangebench.cli.time.perf_counter", side_effect=lambda: next(clock)),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            cmd_probe(args)
+        text = out.getvalue()
+        self.assertEqual(len(calls), 3)
+        self.assertIn("sample 2: latency 1.00s tokens 50 (reasoning 20) 50.0 tok/s", text)
+        self.assertIn("mean latency 1.83s median latency 2.00s", text)
+        self.assertIn("mean tokens/sec 31.7 n=3/3", text)
 
 
 if __name__ == "__main__":
