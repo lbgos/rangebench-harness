@@ -196,7 +196,9 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(manifest["observed_source"], changed)
         self.assertEqual(manifest["task_count"], 1)
         self.assertEqual(manifest["service_image_ids"][0]["images"], saved["service_image_ids"])
-        self.assertEqual(manifest["service_image_fingerprints"][0]["images"], saved["service_image_fingerprints"])
+        self.assertEqual(
+            manifest["service_image_fingerprints"][0]["images"], saved["service_image_fingerprints"]
+        )
         self.assertFalse(saved["scored"])
         self.assertEqual(saved["end_reason"], "source changed")
         self.assertEqual(saved["fail_class"], "env_error")
@@ -446,7 +448,9 @@ class AccountingTests(unittest.TestCase):
             patch.object(env, "_verify_compose_config", return_value=["target"]),
             patch.object(env, "verify_isolation"),
             patch.object(env, "inspect_service_images", return_value={"target": "sha256:recorded"}),
-            patch.object(env, "inspect_service_image_fingerprints", return_value={"target": "sha256:content"}),
+            patch.object(
+                env, "inspect_service_image_fingerprints", return_value={"target": "sha256:content"}
+            ),
         ):
             env.up()
         docker_run = next(
@@ -498,21 +502,31 @@ class AccountingTests(unittest.TestCase):
         }
         changed_project = json.loads(json.dumps(image))
         changed_project["Config"]["Labels"]["com.docker.compose.project"] = "run-b"
-        self.assertEqual(image_content_fingerprint(image), image_content_fingerprint(changed_project))
+        self.assertEqual(
+            image_content_fingerprint(image), image_content_fingerprint(changed_project)
+        )
         self.assertEqual(image["Config"]["Labels"]["com.docker.compose.project"], "run-a")
 
         for field, change in (
-            ("layer contents", lambda candidate: candidate["RootFS"]["Layers"].__setitem__(1, "sha256:other")),
+            (
+                "layer contents",
+                lambda candidate: candidate["RootFS"]["Layers"].__setitem__(1, "sha256:other"),
+            ),
             ("layers", lambda candidate: candidate["RootFS"]["Layers"].reverse()),
             ("config", lambda candidate: candidate["Config"]["Env"].append("OTHER=1")),
-            ("other label", lambda candidate: candidate["Config"]["Labels"].update({"app.version": "2"})),
+            (
+                "other label",
+                lambda candidate: candidate["Config"]["Labels"].update({"app.version": "2"}),
+            ),
             ("os", lambda candidate: candidate.update({"Os": "windows"})),
             ("architecture", lambda candidate: candidate.update({"Architecture": "arm64"})),
         ):
             with self.subTest(field=field):
                 changed = json.loads(json.dumps(image))
                 change(changed)
-                self.assertNotEqual(image_content_fingerprint(image), image_content_fingerprint(changed))
+                self.assertNotEqual(
+                    image_content_fingerprint(image), image_content_fingerprint(changed)
+                )
 
     def test_image_fingerprint_normalizes_inspect_api_defaults(self) -> None:
         image = {
@@ -522,18 +536,20 @@ class AccountingTests(unittest.TestCase):
             "Architecture": "amd64",
         }
         older_api = json.loads(json.dumps(image))
-        older_api["Config"].update({
-            "Hostname": "",
-            "Domainname": "",
-            "AttachStdin": False,
-            "Image": "",
-            "Entrypoint": None,
-            "Labels": {"com.docker.compose.project": "run-a"},
-            "OnBuild": [],
-            "User": "",
-            "Volumes": {},
-            "WorkingDir": "",
-        })
+        older_api["Config"].update(
+            {
+                "Hostname": "",
+                "Domainname": "",
+                "AttachStdin": False,
+                "Image": "",
+                "Entrypoint": None,
+                "Labels": {"com.docker.compose.project": "run-a"},
+                "OnBuild": [],
+                "User": "",
+                "Volumes": {},
+                "WorkingDir": "",
+            }
+        )
         self.assertEqual(image_content_fingerprint(image), image_content_fingerprint(older_api))
 
         for field, value in (
@@ -545,7 +561,9 @@ class AccountingTests(unittest.TestCase):
             with self.subTest(field=field):
                 changed = json.loads(json.dumps(image))
                 changed["Config"][field] = value
-                self.assertNotEqual(image_content_fingerprint(image), image_content_fingerprint(changed))
+                self.assertNotEqual(
+                    image_content_fingerprint(image), image_content_fingerprint(changed)
+                )
 
     def test_service_fingerprints_inspect_exact_image_ids(self) -> None:
         task = Task("sample", Path("/tmp"), "web", 1, "Find the flag")
@@ -565,7 +583,9 @@ class AccountingTests(unittest.TestCase):
             for image in (inspected, second)
         ]
         with patch("rangebench.env._run", side_effect=responses) as run:
-            fingerprints = env.inspect_service_image_fingerprints({"api": image_a, "worker": image_b})
+            fingerprints = env.inspect_service_image_fingerprints(
+                {"api": image_a, "worker": image_b}
+            )
         self.assertEqual(fingerprints["api"], fingerprints["worker"])
         self.assertEqual(fingerprints["api"], image_content_fingerprint(inspected))
         self.assertEqual(

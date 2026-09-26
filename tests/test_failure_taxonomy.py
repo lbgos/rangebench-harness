@@ -87,7 +87,11 @@ class ScriptedResultClient:
 
 def single_stage_task(tmp: Path) -> Task:
     return Task(
-        "sample", tmp, "web", 1, "Find the flag",
+        "sample",
+        tmp,
+        "web",
+        1,
+        "Find the flag",
         stages=[Stage("one", "/flag", "target")],
     )
 
@@ -199,9 +203,7 @@ class RefusalTests(unittest.TestCase):
         result, records = self.run_attempt_with(client)
         self.assertEqual(result.end_reason, "model produced no content 11x")
         self.assertEqual(result.refusals, 11)
-        self.assertEqual(
-            sum(1 for record in records if record["kind"] == "refusal"), 11
-        )
+        self.assertEqual(sum(1 for record in records if record["kind"] == "refusal"), 11)
 
     def test_is_refusal_prefers_typed_reason_and_narrow_text(self) -> None:
         self.assertTrue(is_refusal("I can’t assist with that request."))
@@ -209,12 +211,8 @@ class RefusalTests(unittest.TestCase):
         self.assertFalse(is_refusal("I cannot reach the host from this box."))
         self.assertFalse(is_refusal("I'm sorry the scan failed, retrying with nmap."))
         self.assertFalse(is_refusal("I apologize for the delay; running the scan now."))
-        self.assertFalse(
-            is_refusal("scan the target", ResponseMetadata("stop", False, False, 8))
-        )
-        self.assertTrue(
-            is_refusal("scan the target", ResponseMetadata("refusal", False, False, 8))
-        )
+        self.assertFalse(is_refusal("scan the target", ResponseMetadata("stop", False, False, 8)))
+        self.assertTrue(is_refusal("scan the target", ResponseMetadata("refusal", False, False, 8)))
         self.assertFalse(is_refusal("", ResponseMetadata(None, True, False, 8)))
 
 
@@ -264,7 +262,11 @@ class RunSummaryTests(unittest.TestCase):
 
     def test_run_json_and_summary_report_fail_class_and_refusals(self) -> None:
         task = Task(
-            "sample", Path(tempfile.gettempdir()), "web", 1, "Find the flag",
+            "sample",
+            Path(tempfile.gettempdir()),
+            "web",
+            1,
+            "Find the flag",
             stages=[Stage("one", "/flag", "web")],
         )
         result = AttemptResult(task.id, 1, effective_ctx_window=128000, end_reason="turn budget")

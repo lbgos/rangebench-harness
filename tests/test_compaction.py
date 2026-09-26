@@ -288,7 +288,11 @@ class CompactionTests(unittest.TestCase):
                 self, messages: list[dict], max_tokens: int, temperature: float = 0.2
             ) -> tuple[str, Usage, str | None]:
                 self.calls.append(messages)
-                return f"<FACT_CHUNK_{len(self.calls)}>", Usage(prompt_tokens=90, completion_tokens=20), None
+                return (
+                    f"<FACT_CHUNK_{len(self.calls)}>",
+                    Usage(prompt_tokens=90, completion_tokens=20),
+                    None,
+                )
 
         client = ForgetfulClient()
         compacted, _, error, api_error = _compact_history_llm(
@@ -377,18 +381,34 @@ class CompactionTests(unittest.TestCase):
         messages = history(8, "x" * 500)
         result = AttemptResult("test", 1, wrong=2)
         first = _maybe_compact(
-            FakeClient(), messages, result, 1200, 200, 2, 0.8, False,
+            FakeClient(),
+            messages,
+            result,
+            1200,
+            200,
+            2,
+            0.8,
+            False,
             lambda kind, **kwargs: None,
         )
         first.extend(history(5)[2:])
         second = _maybe_compact(
-            FakeClient(), first, result, 1200, 200, 1, 0.8, False,
+            FakeClient(),
+            first,
+            result,
+            1200,
+            200,
+            1,
+            0.8,
+            False,
             lambda kind, **kwargs: None,
         )
         for compacted in (first, second):
             state = json.loads(
-                compacted[2]["content"].split(RUN_STATE_START, 1)[1]
-                .split(RUN_STATE_END, 1)[0].strip()
+                compacted[2]["content"]
+                .split(RUN_STATE_START, 1)[1]
+                .split(RUN_STATE_END, 1)[0]
+                .strip()
             )
             self.assertEqual(state, {"wrong_submissions": 2, "wrong_limit": 3})
 

@@ -31,7 +31,9 @@ class FakeEnv:
 
 
 class AnswerClient:
-    def chat(self, _messages: list[dict], max_tokens: int, temperature: float = 0.2) -> tuple[str, Usage, None]:
+    def chat(
+        self, _messages: list[dict], max_tokens: int, temperature: float = 0.2
+    ) -> tuple[str, Usage, None]:
         return "ANSWER: flag{test}", Usage(), None
 
 
@@ -58,7 +60,11 @@ class RunnerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp, patch("rangebench.runner.TaskEnv", FakeEnv):
             task = Task(
-                "sample", Path(tmp), "web", 1, "Find the flag",
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
                 stages=[Stage("one", "/flag", "target")],
             )
             result = run_attempt(MetadataClient(), task, 1, "rb-test", Path(tmp), verbose=False)
@@ -85,7 +91,9 @@ class RunnerTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
 
-            def chat(self, _messages: list[dict], max_tokens: int, temperature: float = 0.2) -> tuple[str, Usage, None]:
+            def chat(
+                self, _messages: list[dict], max_tokens: int, temperature: float = 0.2
+            ) -> tuple[str, Usage, None]:
                 self.calls += 1
                 content = "ANSWER: flag{test}" if self.calls == 36 else "COMMAND:\ntrue"
                 return content, Usage(prompt_tokens=20, completion_tokens=10), None
@@ -93,7 +101,14 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(all(task.turns is None for task in load_all()))
         client = SlowClient()
         with tempfile.TemporaryDirectory() as tmp, patch("rangebench.runner.TaskEnv", FakeEnv):
-            task = Task("sample", Path(tmp), "web", 1, "Find the flag", stages=[Stage("one", "/flag", "target")])
+            task = Task(
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+            )
             result = run_attempt(client, task, 1, "rb-test", Path(tmp), verbose=False)
         self.assertEqual(result.end_reason, "all stages captured")
         self.assertEqual(result.turns_used, 36)
@@ -128,8 +143,13 @@ class RunnerTests(unittest.TestCase):
             patch("rangebench.env.subprocess.run") as run,
         ):
             task = Task(
-                "sample", Path(tmp), "web", 1, "Find the flag",
-                stages=[Stage("one", "/flag", "target")], turns=2,
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+                turns=2,
             )
             result = run_attempt(SurrogateClient(), task, 1, "rb-test", Path(tmp), verbose=False)
             raw = (Path(tmp) / "sample-t1.jsonl").read_text()
@@ -144,7 +164,9 @@ class RunnerTests(unittest.TestCase):
         )
         run.assert_not_called()
 
-    def _run_with_output(self, output: str, save_fails: bool = False) -> tuple[list[dict], list[dict], list[str]]:
+    def _run_with_output(
+        self, output: str, save_fails: bool = False
+    ) -> tuple[list[dict], list[dict], list[str]]:
         """Run one command turn returning `output`; return (log records, messages, saved)."""
         saved: list[str] = []
         seen: list[list[dict]] = []
@@ -160,15 +182,27 @@ class RunnerTests(unittest.TestCase):
                 return f"/work/obs/{len(saved):04d}.log"
 
         class CommandThenAnswer:
-            def chat(self, messages: list[dict], max_tokens: int, temperature: float = 0.2) -> tuple[str, Usage, None]:
+            def chat(
+                self, messages: list[dict], max_tokens: int, temperature: float = 0.2
+            ) -> tuple[str, Usage, None]:
                 seen.append(list(messages))
                 content = "COMMAND:\ncat big" if len(seen) == 1 else "ANSWER: flag{test}"
                 return content, Usage(prompt_tokens=20, completion_tokens=10), None
 
         with tempfile.TemporaryDirectory() as tmp, patch("rangebench.runner.TaskEnv", OutputEnv):
-            task = Task("sample", Path(tmp), "web", 1, "Find the flag", stages=[Stage("one", "/flag", "target")])
+            task = Task(
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+            )
             result = run_attempt(CommandThenAnswer(), task, 1, "rb-test", Path(tmp), verbose=False)
-            records = [json.loads(line) for line in (Path(tmp) / "sample-t1.jsonl").read_text().splitlines()]
+            records = [
+                json.loads(line)
+                for line in (Path(tmp) / "sample-t1.jsonl").read_text().splitlines()
+            ]
         self.assertEqual(result.end_reason, "all stages captured")
         return records, seen[-1], saved
 
@@ -179,7 +213,9 @@ class RunnerTests(unittest.TestCase):
         exec_rec = next(r for r in records if r["kind"] == "exec")
         self.assertNotIn("pager", exec_rec)
         self.assertEqual(exec_rec["out"], truncate_output(output))
-        self.assertEqual(messages[-1]["content"], f"OBSERVATION (exit 0):\n{truncate_output(output)}")
+        self.assertEqual(
+            messages[-1]["content"], f"OBSERVATION (exit 0):\n{truncate_output(output)}"
+        )
 
     def test_threshold_boundary_counts_final_line_without_newline(self) -> None:
         output = "\n".join(f"line {i}" for i in range(401))
@@ -221,7 +257,9 @@ class RunnerTests(unittest.TestCase):
         exec_rec = next(r for r in records if r["kind"] == "exec")
         self.assertNotIn("pager", exec_rec)
         self.assertEqual(exec_rec["out"], truncate_output(output))
-        self.assertEqual(messages[-1]["content"], f"OBSERVATION (exit 0):\n{truncate_output(output)}")
+        self.assertEqual(
+            messages[-1]["content"], f"OBSERVATION (exit 0):\n{truncate_output(output)}"
+        )
 
     def test_save_output_pipes_content_over_stdin(self) -> None:
         task = Task("sample", Path("/tmp"), "web", 1, "Find the flag")
@@ -234,13 +272,28 @@ class RunnerTests(unittest.TestCase):
         argv = run.call_args_list[0].args[0]
         self.assertEqual(argv[:3], ["docker", "exec", "-i"])
         self.assertNotIn("big", " ".join(argv))
-        self.assertEqual(run.call_args_list[0].kwargs["input"], "big \udcff output".encode("utf-8", "surrogatepass"))
+        self.assertEqual(
+            run.call_args_list[0].kwargs["input"],
+            "big \udcff output".encode("utf-8", "surrogatepass"),
+        )
 
     def test_keep_writes_event_before_closing_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch("rangebench.runner.TaskEnv", FakeEnv):
-            task = Task("sample", Path(tmp), "web", 1, "Find the flag", stages=[Stage("one", "/flag", "target")])
-            result = run_attempt(AnswerClient(), task, 1, "rb-test", Path(tmp), verbose=False, keep=True)
-            records = [json.loads(line) for line in (Path(tmp) / "sample-t1.jsonl").read_text().splitlines()]
+            task = Task(
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+            )
+            result = run_attempt(
+                AnswerClient(), task, 1, "rb-test", Path(tmp), verbose=False, keep=True
+            )
+            records = [
+                json.loads(line)
+                for line in (Path(tmp) / "sample-t1.jsonl").read_text().splitlines()
+            ]
 
         self.assertEqual(result.end_reason, "all stages captured")
         self.assertEqual(result.service_image_ids, {"target": "sha256:" + "a" * 64})
@@ -257,8 +310,18 @@ class RunnerTests(unittest.TestCase):
                 self.service_image_fingerprints = {}
                 raise EnvError("no container for service target")
 
-        with tempfile.TemporaryDirectory() as tmp, patch("rangebench.runner.TaskEnv", MissingImageEnv):
-            task = Task("sample", Path(tmp), "web", 1, "Find the flag", stages=[Stage("one", "/flag", "target")])
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("rangebench.runner.TaskEnv", MissingImageEnv),
+        ):
+            task = Task(
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+            )
             result = run_attempt(NoCallsClient(), task, 1, "rb-test", Path(tmp), verbose=False)
         self.assertEqual(result.end_reason, "env: no container for service target")
         self.assertEqual(result.service_image_ids, {})
@@ -269,25 +332,48 @@ class RunnerTests(unittest.TestCase):
             def up(self) -> None:
                 raise EnvError("attacker container failed")
 
-        with tempfile.TemporaryDirectory() as tmp, patch("rangebench.runner.TaskEnv", LateFailureEnv):
-            task = Task("sample", Path(tmp), "web", 1, "Find the flag", stages=[Stage("one", "/flag", "target")])
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("rangebench.runner.TaskEnv", LateFailureEnv),
+        ):
+            task = Task(
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+            )
             result = run_attempt(NoCallsClient(), task, 1, "rb-test", Path(tmp), verbose=False)
-            records = [json.loads(line) for line in (Path(tmp) / "sample-t1.jsonl").read_text().splitlines()]
+            records = [
+                json.loads(line)
+                for line in (Path(tmp) / "sample-t1.jsonl").read_text().splitlines()
+            ]
         self.assertEqual(result.end_reason, "env: attacker container failed")
         expected = {"target": "sha256:" + "a" * 64}
         self.assertEqual(result.service_image_ids, expected)
         self.assertEqual(records[-1]["service_image_ids"], expected)
         self.assertEqual(result.service_image_fingerprints, {"target": "sha256:" + "b" * 64})
-        self.assertEqual(records[-1]["service_image_fingerprints"], result.service_image_fingerprints)
+        self.assertEqual(
+            records[-1]["service_image_fingerprints"], result.service_image_fingerprints
+        )
 
     def test_oracle_failure_is_fatal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             solution = Path(tmp) / "solution"
             solution.mkdir()
             (solution / "solve.sh").write_text("#!/bin/sh\nexit 0\n")
-            task = Task("sample", Path(tmp), "web", 1, "Find the flag", stages=[Stage("one", "/flag", "target")])
-            with patch("rangebench.runner.TaskEnv", FakeEnv), patch(
-                "subprocess.run", return_value=SimpleNamespace(returncode=0, stderr="")
+            task = Task(
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+            )
+            with (
+                patch("rangebench.runner.TaskEnv", FakeEnv),
+                patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stderr="")),
             ):
                 with self.assertRaisesRegex(EnvError, "oracle failed"):
                     run_oracle(task)
@@ -298,13 +384,21 @@ class RunnerTests(unittest.TestCase):
             solution.mkdir()
             (solution / "solve.sh").write_text("#!/bin/sh\nexit 0\n")
             (solution / "helper.sh").write_text("#!/bin/sh\n")
-            task = Task("sample", Path(tmp), "web", 1, "Find the flag", stages=[Stage("one", "/flag", "target")])
+            task = Task(
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+            )
             copies = [
                 SimpleNamespace(returncode=0, stderr=""),
                 SimpleNamespace(returncode=1, stderr="copy failed"),
             ]
-            with patch("rangebench.runner.TaskEnv", FakeEnv), patch(
-                "subprocess.run", side_effect=copies
+            with (
+                patch("rangebench.runner.TaskEnv", FakeEnv),
+                patch("subprocess.run", side_effect=copies),
             ):
                 with self.assertRaisesRegex(EnvError, "docker cp helper.sh"):
                     run_oracle(task)

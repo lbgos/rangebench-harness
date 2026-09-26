@@ -8,15 +8,18 @@ import html
 import json
 import math
 import os
+import shutil
 import statistics
 import subprocess
 import time
 import uuid
+from collections import defaultdict
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
 from .agent import AnthropicChatClient, ChatClient, ChatClientProtocol, Usage
-from .env import TASKS_DIR, EnvError, load_all, load_task
+from .env import TASKS_DIR, EnvError, Task, load_all, load_task
 from .identity import all_task_identities
 from .runner import (
     DEFAULT_CTX_WINDOW,
@@ -26,6 +29,7 @@ from .runner import (
     FAIL_CLASSES,
     MAX_CTX_WINDOW,
     MAX_WALL_CLOCK_SCALE,
+    AttemptResult,
     classify_end_reason,
     run_attempt,
     run_oracle,
@@ -285,7 +289,30 @@ def cmd_check(args: argparse.Namespace) -> None:
         run_oracle(load_task(tid), project=f"rb-oracle-{uuid.uuid4().hex[:10]}")
 
 
-def cmd_run(args: argparse.Namespace) -> None:
+def _base_url(args: argparse.Namespace) -> str:
+    """--base-url, else $OPENAI_BASE_URL, else the local default."""
+    return args.base_url or os.environ.get("OPENAI_BASE_URL", "http://localhost:8000/v1")
+
+
+def _make_client(args: argparse.Namespace, base: str) -> ChatClientProtocol:
+    """The chat client for --provider, --model and (openai only) --reasoning-effort."""
+    if getattr(args, "provider", "openai") == "anthropic":
+        return AnthropicChatClient(
+            base_url=base,
+            api_key=os.environ.get("ANTHROPIC_API_KEY")
+            or os.environ.get("OPENAI_API_KEY", "dummy"),
+            model=args.model,
+        )
+    return ChatClient(
+        base_url=base,
+        api_key=os.environ.get("OPENAI_API_KEY", "dummy"),
+        model=args.model,
+        reasoning_effort=getattr(args, "reasoning_effort", None),
+    )
+
+
+def _validate_run_args(args: argparse.Namespace) -> tuple[float | None, dict | None]:
+    """Check run flags; return (manual wall-clock scale, loaded reference). SystemExit on error."""
     if args.trials < 1:
         raise SystemExit("--trials must be at least 1")
     if (
@@ -298,46 +325,262 @@ def cmd_run(args: argparse.Namespace) -> None:
         raise SystemExit("--keep-tail must be nonnegative and --threshold must be between 0 and 1")
     wall_clock_scale = getattr(args, "wall_clock_scale", None)
     reference_path = getattr(args, "wall_clock_reference", None)
-    reference: dict | None = None
     if reference_path is not None:
         if wall_clock_scale is not None:
             raise SystemExit("--wall-clock-scale and --wall-clock-reference are mutually exclusive")
-        reference = _load_wall_clock_reference(reference_path)
-    else:
-        if wall_clock_scale is None:
-            wall_clock_scale = 1.0
-        if not 0 < wall_clock_scale <= MAX_WALL_CLOCK_SCALE:
-            raise SystemExit(
-                f"--wall-clock-scale must be above 0 and at most {MAX_WALL_CLOCK_SCALE}"
-            )
-    task_ids = args.tasks if args.tasks else [t.id for t in load_all()]
-    base = (
-        os.environ.get("OPENAI_BASE_URL", "http://localhost:8000/v1")
-        if not args.base_url
-        else args.base_url
+        return wall_clock_scale, _load_wall_clock_reference(reference_path)
+    if wall_clock_scale is None:
+        wall_clock_scale = 1.0
+    if not 0 < wall_clock_scale <= MAX_WALL_CLOCK_SCALE:
+        raise SystemExit(f"--wall-clock-scale must be above 0 and at most {MAX_WALL_CLOCK_SCALE}")
+    return wall_clock_scale, None
+
+
+def _write_run_doc(out: Path, doc: dict) -> None:
+    """Write the run doc to its own file and to latest.json from one serialization."""
+    text = json.dumps(doc, indent=2)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text)
+    (RESULTS / "latest.json").write_text(text)
+
+
+def _verify_source(
+    doc: dict,
+    expected: dict[str, str | None],
+    out: Path,
+    log_dir: Path,
+    completed_attempt: bool = False,
+) -> None:
+    """Stop the run if the source fingerprint moved, unscoring the attempt just finished."""
+    current = _source_fingerprint()
+    if current == expected:
+        return
+    if completed_attempt:
+        doc["tasks"][-1]["scored"] = False
+        doc["tasks"][-1]["end_reason"] = "source changed"
+        doc["tasks"][-1]["fail_class"] = classify_end_reason("source changed", False)
+    doc["finished"] = datetime.now(UTC).isoformat()
+    if completed_attempt:
+        _write_run_doc(out, doc)
+    _write_manifest(log_dir, doc, extra={"status": "source_changed", "observed_source": current})
+    raise SystemExit("benchmark source changed during run; rerun from a frozen checkout")
+
+
+def _attempt(
+    args: argparse.Namespace,
+    client: ChatClientProtocol,
+    task: Task,
+    trial: int,
+    project: str,
+    log_dir: Path,
+    attacker_digest: str,
+    wall_clock_scale: float,
+    model_tps: float | None,
+) -> AttemptResult:
+    """run_attempt with the run's compaction and --keep settings."""
+    return run_attempt(
+        client,
+        task,
+        trial,
+        project,
+        log_dir,
+        keep=args.keep,
+        ctx_window=args.ctx_window,
+        reserve=args.reserve,
+        keep_tail=args.keep_tail,
+        threshold=args.threshold,
+        use_llm_compact=getattr(args, "compact", "llm") == "llm",
+        attacker_image=attacker_digest,
+        wall_clock_scale=wall_clock_scale,
+        model_tps=model_tps,
     )
+
+
+def _measure_model_tps(
+    args: argparse.Namespace,
+    client: ChatClientProtocol,
+    doc: dict,
+    task_ids: list[str],
+    log_dir: Path,
+    attacker_digest: str,
+    verify_source: Callable[[], None],
+) -> float:
+    """Run one unscored probe attempt and return the model's tokens/sec.
+
+    Records the probe in doc; on any failure writes a probe_failed manifest and
+    exits before the run starts.
+    """
+    probe_task_id = getattr(args, "wall_clock_probe_task", None) or PROBE_TASK
+    if probe_task_id in task_ids:
+        _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
+        raise SystemExit(
+            f"--wall-clock-probe-task {probe_task_id} is also a run task; its probe "
+            "attempt would overwrite that task's trial-1 transcript"
+        )
+    try:
+        probe_task = load_task(probe_task_id)
+    except EnvError as exc:
+        _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
+        raise SystemExit(f"--wall-clock-probe-task {probe_task_id}: {exc}") from None
+    verify_source()
+    try:
+        probe = _attempt(
+            args,
+            client,
+            probe_task,
+            1,
+            f"rb-{probe_task.id}-probe-{uuid.uuid4().hex[:6]}",
+            log_dir,
+            attacker_digest,
+            1.0,
+            None,
+        )
+    except Exception as exc:
+        _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
+        raise SystemExit(
+            f"wall-clock reference probe attempt failed ({exc or type(exc).__name__}); "
+            "run not started"
+        ) from None
+    try:
+        tokens, llm_s, calls = transcript_tps(log_dir / f"{probe_task.id}-t1.jsonl")
+    except OSError:
+        tokens, llm_s, calls = 0, 0.0, 0
+    if tokens < 500 or llm_s < 1.0 or calls < 3:
+        _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
+        raise SystemExit(
+            f"wall-clock reference probe failed ({tokens} tokens over {llm_s:.1f}s across "
+            f"{calls} calls; need >=500 tokens over >=1s across >=3 calls; attempt ended: "
+            f"{probe.end_reason or 'unknown'}); run not started"
+        )
+    model_tps = tokens / llm_s
+    doc["probe_task"] = probe_task_id
+    doc["probe_attempt"] = {
+        "task": probe_task_id,
+        "solved": sorted(probe.solved) == sorted(s.name for s in probe_task.stages),
+        "end_reason": probe.end_reason,
+        "wall_s": probe.wall_s,
+        "completion_tokens": probe.completion_tokens,
+        "llm_s": round(llm_s, 1),
+        "calls": calls,
+        "model_tps": model_tps,
+    }
+    doc["model_tps"] = model_tps
+    return model_tps
+
+
+def _attempt_record(task: Task, trial: int, res: AttemptResult, task_scale: float) -> dict:
+    """The run doc's tasks[] entry for one finished attempt."""
+    usage = res.total_usage()
+    solved = sorted(res.solved) == sorted(s.name for s in task.stages)
+    return {
+        "task": task.id,
+        "category": task.category,
+        "tier": task.tier,
+        "trial": trial,
+        "solved_stages": res.solved,
+        "stages_total": [s.name for s in task.stages],
+        "solved": solved,
+        "scored": not (
+            res.end_reason.startswith("env:")
+            or res.end_reason in {"infra timeout", "llm error", "context window exhausted"}
+        ),
+        "fail_class": classify_end_reason(res.end_reason, solved),
+        "wrong": res.wrong,
+        "refusals": res.refusals,
+        "turns_used": res.turns_used,
+        "turns_budget": task.turns,
+        "effective_ctx_window": res.effective_ctx_window,
+        "commands": res.commands,
+        "service_image_ids": res.service_image_ids,
+        "service_image_fingerprints": res.service_image_fingerprints,
+        "prompt_tokens": res.prompt_tokens,
+        "completion_tokens": res.completion_tokens,
+        "reasoning_tokens": res.reasoning_tokens,
+        "compaction_tokens": res.compaction_tokens,
+        "compaction_fallbacks": res.compaction_fallbacks,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_read_tokens": usage.cache_read_tokens,
+        "cache_write_tokens": usage.cache_write_tokens,
+        "api_calls": usage.calls,
+        "api_requests": usage.requests,
+        "usage_reported_calls": usage.reported_calls,
+        "input_reported_calls": usage.input_reported_calls,
+        "output_reported_calls": usage.output_reported_calls,
+        "cache_read_reported_calls": usage.cache_read_reported_calls,
+        "cache_write_reported_calls": usage.cache_write_reported_calls,
+        "compaction_input_tokens": res.compaction_usage.input_tokens,
+        "compaction_output_tokens": res.compaction_usage.output_tokens,
+        "compaction_cache_read_tokens": res.compaction_usage.cache_read_tokens,
+        "compaction_cache_write_tokens": res.compaction_usage.cache_write_tokens,
+        "wall_s": res.wall_s,
+        "wall_clock_scale": task_scale,
+        "wall_clock_seconds": res.wall_clock_seconds,
+        "wall_clock_exceeded": res.wall_clock_exceeded,
+        "end_reason": res.end_reason,
+        "max_output_tokens": task.max_output_tokens,
+    }
+
+
+def _print_run_summary(tasks: list[dict], trials: int, invalid: int) -> None:
+    """Print solve counts, per-category/tier splits, failure classes, and per-task rows."""
+    scored = [t for t in tasks if t["scored"]]
+    solved_count = sum(1 for t in scored if t["solved"])
+    total = len(scored)
+    print(f"tasks solved: {solved_count}/{total} scored runs ({invalid} invalid)")
+    by_cat = defaultdict(list)
+    for t in tasks:
+        by_cat[t["category"]].append(t)
+    print("\nper-category:")
+    for cat, lst in sorted(by_cat.items()):
+        valid = [x for x in lst if x["scored"]]
+        s = sum(1 for x in valid if x["solved"])
+        print(f"  {cat:10} {s}/{len(valid)} ({len(lst) - len(valid)} invalid)")
+    by_tier = defaultdict(list)
+    for t in tasks:
+        by_tier[t["tier"]].append(t)
+    print("per-tier:")
+    for tier in sorted(by_tier):
+        lst = by_tier[tier]
+        valid = [x for x in lst if x["scored"]]
+        s = sum(1 for x in valid if x["solved"])
+        print(f"  T{tier} {s}/{len(valid)} ({len(lst) - len(valid)} invalid)")
+    fail_counts = {name: sum(1 for t in tasks if t["fail_class"] == name) for name in FAIL_CLASSES}
+    print("failure classes: " + " ".join(f"{name}={fail_counts[name]}" for name in FAIL_CLASSES))
+    refusal_turns = sum(int(t["refusals"]) for t in tasks)
+    refusing = sum(1 for t in tasks if t["refusals"])
+    print(f"refusals: {refusal_turns} turns in {refusing}/{len(tasks)} attempts")
+    if trials > 1:
+        p = solved_count / total if total else 0
+        lo, hi = _wilson(p, total)
+        print(f"overall Wilson 95%: {p:.2%} [{lo:.2%}, {hi:.2%}] n={total}")
+        _print_pass_at_k(tasks, trials)
+    toks = [t["completion_tokens"] for t in tasks]
+    if toks:
+        print(
+            f"output tokens: mean {statistics.mean(toks):.0f} median {statistics.median(toks):.0f} max {max(toks)}"
+        )
+    print("\nper-task:")
+    print(f"{'task':20} {'solved':6} {'turns':10} {'out_tok':10} {'wall':8} end")
+    for t in tasks:
+        out_tok = t["completion_tokens"]
+        print(
+            f"{t['task']:20} {str(t['solved']):6} {t['turns_used']}/{str(t['turns_budget']) if t['turns_budget'] is not None else '∞':<6} {out_tok:<10} {t['wall_s']:<8} {t['end_reason']}"
+        )
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    wall_clock_scale, reference = _validate_run_args(args)
+    reference_path = getattr(args, "wall_clock_reference", None)
+    task_ids = args.tasks if args.tasks else [t.id for t in load_all()]
+    base = _base_url(args)
     if not args.base_url and "OPENAI_BASE_URL" not in os.environ:
         print(f"[warn] OPENAI_BASE_URL not set, using default {base}", flush=True)
     attacker_digest = _get_attacker_digest()
     if not attacker_digest:
         raise SystemExit("rb-attacker image ID unavailable; run preflight first")
-    # provider switch
     provider = getattr(args, "provider", "openai")
-    client: ChatClientProtocol
-    if provider == "anthropic":
-        client = AnthropicChatClient(
-            base_url=base,
-            api_key=os.environ.get("ANTHROPIC_API_KEY")
-            or os.environ.get("OPENAI_API_KEY", "dummy"),
-            model=args.model,
-        )
-    else:
-        client = ChatClient(
-            base_url=base,
-            api_key=os.environ.get("OPENAI_API_KEY", "dummy"),
-            model=args.model,
-            reasoning_effort=getattr(args, "reasoning_effort", None),
-        )
+    client = _make_client(args, base)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
     log_dir = RESULTS / run_id
     out = RESULTS / f"{run_id}.json"
@@ -368,85 +611,14 @@ def cmd_run(args: argparse.Namespace) -> None:
     _write_manifest(log_dir, doc, extra={"status": "running"})
 
     def verify_source(completed_attempt: bool = False) -> None:
-        current = _source_fingerprint()
-        if current != source_fingerprint:
-            if completed_attempt:
-                doc["tasks"][-1]["scored"] = False
-                doc["tasks"][-1]["end_reason"] = "source changed"
-                doc["tasks"][-1]["fail_class"] = classify_end_reason("source changed", False)
-            doc["finished"] = datetime.now(UTC).isoformat()
-            if completed_attempt:
-                out.parent.mkdir(parents=True, exist_ok=True)
-                out.write_text(json.dumps(doc, indent=2))
-                (RESULTS / "latest.json").write_text(json.dumps(doc, indent=2))
-            _write_manifest(
-                log_dir, doc, extra={"status": "source_changed", "observed_source": current}
-            )
-            raise SystemExit("benchmark source changed during run; rerun from a frozen checkout")
+        _verify_source(doc, source_fingerprint, out, log_dir, completed_attempt)
 
     model_tps: float | None = None
     if reference is not None:
         # One unscored agent attempt measures generation speed; fail before the run starts.
-        probe_task_id = getattr(args, "wall_clock_probe_task", None) or PROBE_TASK
-        if probe_task_id in task_ids:
-            _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
-            raise SystemExit(
-                f"--wall-clock-probe-task {probe_task_id} is also a run task; its probe "
-                "attempt would overwrite that task's trial-1 transcript"
-            )
-        try:
-            probe_task = load_task(probe_task_id)
-        except EnvError as exc:
-            _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
-            raise SystemExit(f"--wall-clock-probe-task {probe_task_id}: {exc}") from None
-        verify_source()
-        try:
-            probe = run_attempt(
-                client,
-                probe_task,
-                1,
-                f"rb-{probe_task.id}-probe-{uuid.uuid4().hex[:6]}",
-                log_dir,
-                keep=args.keep,
-                ctx_window=args.ctx_window,
-                reserve=args.reserve,
-                keep_tail=args.keep_tail,
-                threshold=args.threshold,
-                use_llm_compact=getattr(args, "compact", "llm") == "llm",
-                attacker_image=attacker_digest,
-                wall_clock_scale=1.0,
-                model_tps=None,
-            )
-        except Exception as exc:
-            _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
-            raise SystemExit(
-                f"wall-clock reference probe attempt failed ({exc or type(exc).__name__}); "
-                "run not started"
-            ) from None
-        try:
-            tokens, llm_s, calls = transcript_tps(log_dir / f"{probe_task.id}-t1.jsonl")
-        except OSError:
-            tokens, llm_s, calls = 0, 0.0, 0
-        if tokens < 500 or llm_s < 1.0 or calls < 3:
-            _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
-            raise SystemExit(
-                f"wall-clock reference probe failed ({tokens} tokens over {llm_s:.1f}s across "
-                f"{calls} calls; need >=500 tokens over >=1s across >=3 calls; attempt ended: "
-                f"{probe.end_reason or 'unknown'}); run not started"
-            )
-        model_tps = tokens / llm_s
-        doc["probe_task"] = probe_task_id
-        doc["probe_attempt"] = {
-            "task": probe_task_id,
-            "solved": sorted(probe.solved) == sorted(s.name for s in probe_task.stages),
-            "end_reason": probe.end_reason,
-            "wall_s": probe.wall_s,
-            "completion_tokens": probe.completion_tokens,
-            "llm_s": round(llm_s, 1),
-            "calls": calls,
-            "model_tps": model_tps,
-        }
-        doc["model_tps"] = model_tps
+        model_tps = _measure_model_tps(
+            args, client, doc, task_ids, log_dir, attacker_digest, verify_source
+        )
         _write_manifest(log_dir, doc, extra={"status": "running"})
 
     for tid in task_ids:
@@ -461,80 +633,12 @@ def cmd_run(args: argparse.Namespace) -> None:
         for trial in range(1, args.trials + 1):
             verify_source()
             project = f"rb-{task.id}-{trial}-{uuid.uuid4().hex[:6]}"
-            use_llm = getattr(args, "compact", "llm") == "llm"
-            res = run_attempt(
-                client,
-                task,
-                trial,
-                project,
-                log_dir,
-                keep=args.keep,
-                ctx_window=args.ctx_window,
-                reserve=args.reserve,
-                keep_tail=args.keep_tail,
-                threshold=args.threshold,
-                use_llm_compact=use_llm,
-                attacker_image=attacker_digest,
-                wall_clock_scale=task_scale,
-                model_tps=model_tps,
+            res = _attempt(
+                args, client, task, trial, project, log_dir, attacker_digest, task_scale, model_tps
             )
-            usage = res.total_usage()
-            solved = sorted(res.solved) == sorted(s.name for s in task.stages)
-            doc["tasks"].append(
-                {
-                    "task": task.id,
-                    "category": task.category,
-                    "tier": task.tier,
-                    "trial": trial,
-                    "solved_stages": res.solved,
-                    "stages_total": [s.name for s in task.stages],
-                    "solved": solved,
-                    "scored": not (
-                        res.end_reason.startswith("env:")
-                        or res.end_reason
-                        in {"infra timeout", "llm error", "context window exhausted"}
-                    ),
-                    "fail_class": classify_end_reason(res.end_reason, solved),
-                    "wrong": res.wrong,
-                    "refusals": res.refusals,
-                    "turns_used": res.turns_used,
-                    "turns_budget": task.turns,
-                    "effective_ctx_window": res.effective_ctx_window,
-                    "commands": res.commands,
-                    "service_image_ids": res.service_image_ids,
-                    "service_image_fingerprints": res.service_image_fingerprints,
-                    "prompt_tokens": res.prompt_tokens,
-                    "completion_tokens": res.completion_tokens,
-                    "reasoning_tokens": res.reasoning_tokens,
-                    "compaction_tokens": res.compaction_tokens,
-                    "compaction_fallbacks": res.compaction_fallbacks,
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "cache_read_tokens": usage.cache_read_tokens,
-                    "cache_write_tokens": usage.cache_write_tokens,
-                    "api_calls": usage.calls,
-                    "api_requests": usage.requests,
-                    "usage_reported_calls": usage.reported_calls,
-                    "input_reported_calls": usage.input_reported_calls,
-                    "output_reported_calls": usage.output_reported_calls,
-                    "cache_read_reported_calls": usage.cache_read_reported_calls,
-                    "cache_write_reported_calls": usage.cache_write_reported_calls,
-                    "compaction_input_tokens": res.compaction_usage.input_tokens,
-                    "compaction_output_tokens": res.compaction_usage.output_tokens,
-                    "compaction_cache_read_tokens": res.compaction_usage.cache_read_tokens,
-                    "compaction_cache_write_tokens": res.compaction_usage.cache_write_tokens,
-                    "wall_s": res.wall_s,
-                    "wall_clock_scale": task_scale,
-                    "wall_clock_seconds": res.wall_clock_seconds,
-                    "wall_clock_exceeded": res.wall_clock_exceeded,
-                    "end_reason": res.end_reason,
-                    "max_output_tokens": task.max_output_tokens,
-                }
-            )
+            doc["tasks"].append(_attempt_record(task, trial, res, task_scale))
             verify_source(completed_attempt=True)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(json.dumps(doc, indent=2))
-            (RESULTS / "latest.json").write_text(json.dumps(doc, indent=2))
+            _write_run_doc(out, doc)
             _write_manifest(
                 log_dir,
                 doc,
@@ -545,8 +649,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             )
     verify_source()
     doc["finished"] = datetime.now(UTC).isoformat()
-    out.write_text(json.dumps(doc, indent=2))
-    (RESULTS / "latest.json").write_text(json.dumps(doc, indent=2))
+    _write_run_doc(out, doc)
     invalid = sum(1 for t in doc["tasks"] if not t["scored"])
     _write_manifest(
         log_dir, doc, extra={"status": "completed_with_errors" if invalid else "completed"}
@@ -554,53 +657,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     _write_report_html(log_dir, doc)
     print(f"wrote {out}")
     print(f"wrote {log_dir / 'manifest.json'} and {log_dir / 'report.html'}")
-    scored = [t for t in doc["tasks"] if t["scored"]]
-    solved_count = sum(1 for t in scored if t["solved"])
-    total = len(scored)
-    print(f"tasks solved: {solved_count}/{total} scored runs ({invalid} invalid)")
-    from collections import defaultdict
-
-    by_cat = defaultdict(list)
-    for t in doc["tasks"]:
-        by_cat[t["category"]].append(t)
-    print("\nper-category:")
-    for cat, lst in sorted(by_cat.items()):
-        valid = [x for x in lst if x["scored"]]
-        s = sum(1 for x in valid if x["solved"])
-        print(f"  {cat:10} {s}/{len(valid)} ({len(lst) - len(valid)} invalid)")
-    by_tier = defaultdict(list)
-    for t in doc["tasks"]:
-        by_tier[t["tier"]].append(t)
-    print("per-tier:")
-    for tier in sorted(by_tier):
-        lst = by_tier[tier]
-        valid = [x for x in lst if x["scored"]]
-        s = sum(1 for x in valid if x["solved"])
-        print(f"  T{tier} {s}/{len(valid)} ({len(lst) - len(valid)} invalid)")
-    fail_counts = {
-        name: sum(1 for t in doc["tasks"] if t["fail_class"] == name) for name in FAIL_CLASSES
-    }
-    print("failure classes: " + " ".join(f"{name}={fail_counts[name]}" for name in FAIL_CLASSES))
-    refusal_turns = sum(int(t["refusals"]) for t in doc["tasks"])
-    refusing = sum(1 for t in doc["tasks"] if t["refusals"])
-    print(f"refusals: {refusal_turns} turns in {refusing}/{len(doc['tasks'])} attempts")
-    if args.trials > 1:
-        p = solved_count / total if total else 0
-        lo, hi = _wilson(p, total)
-        print(f"overall Wilson 95%: {p:.2%} [{lo:.2%}, {hi:.2%}] n={total}")
-        _print_pass_at_k(doc["tasks"], args.trials)
-    toks = [t["completion_tokens"] for t in doc["tasks"]]
-    if toks:
-        print(
-            f"output tokens: mean {statistics.mean(toks):.0f} median {statistics.median(toks):.0f} max {max(toks)}"
-        )
-    print("\nper-task:")
-    print(f"{'task':20} {'solved':6} {'turns':10} {'out_tok':10} {'wall':8} end")
-    for t in doc["tasks"]:
-        out_tok = t["completion_tokens"]
-        print(
-            f"{t['task']:20} {str(t['solved']):6} {t['turns_used']}/{str(t['turns_budget']) if t['turns_budget'] is not None else '∞':<6} {out_tok:<10} {t['wall_s']:<8} {t['end_reason']}"
-        )
+    _print_run_summary(doc["tasks"], args.trials, invalid)
     if invalid:
         raise SystemExit(1)
 
@@ -612,22 +669,7 @@ def cmd_probe(args: argparse.Namespace) -> None:
     """
     if args.samples < 1:
         raise SystemExit("--samples must be at least 1")
-    base = args.base_url or os.environ.get("OPENAI_BASE_URL", "http://localhost:8000/v1")
-    provider = getattr(args, "provider", "openai")
-    client: ChatClientProtocol
-    if provider == "anthropic":
-        client = AnthropicChatClient(
-            base,
-            os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY", "dummy"),
-            args.model,
-        )
-    else:
-        client = ChatClient(
-            base,
-            os.environ.get("OPENAI_API_KEY", "dummy"),
-            args.model,
-            reasoning_effort=getattr(args, "reasoning_effort", None),
-        )
+    client = _make_client(args, _base_url(args))
     as_json = getattr(args, "json", False)
     latencies: list[float] = []
     rates: list[float] = []
@@ -668,8 +710,6 @@ def cmd_probe(args: argparse.Namespace) -> None:
 
 def cmd_preflight(_args: argparse.Namespace) -> None:
     """Check docker, compose, and pull all task images without running tasks."""
-    import shutil
-
     if shutil.which("docker") is None:
         print("docker not found", flush=True)
         raise SystemExit(1)

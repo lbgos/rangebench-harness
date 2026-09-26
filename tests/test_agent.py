@@ -59,7 +59,9 @@ class ResponseMetadataTests(unittest.TestCase):
 
         with patch("rangebench.agent.urllib.request.urlopen", side_effect=capture):
             ChatClient("http://localhost/v1", "k", "m").chat(self.messages, 64)
-            ChatClient("http://localhost/v1", "k", "m", reasoning_effort="max").chat(self.messages, 64)
+            ChatClient("http://localhost/v1", "k", "m", reasoning_effort="max").chat(
+                self.messages, 64
+            )
 
         self.assertNotIn("reasoning_effort", payloads[0])
         self.assertEqual(payloads[1]["reasoning_effort"], "max")
