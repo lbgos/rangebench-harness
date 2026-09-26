@@ -440,7 +440,12 @@ def _measure_model_tps(
         tokens, llm_s, calls = transcript_tps(probe_dir / f"{probe_task.id}-t1.jsonl")
     except OSError:
         tokens, llm_s, calls = 0, 0.0, 0
-    if tokens < 500 or llm_s < 1.0 or calls < 3:
+    execution_failed = probe.end_reason.startswith("env:") or probe.end_reason in {
+        "infra timeout",
+        "llm error",
+        "context window exhausted",
+    }
+    if execution_failed or tokens < 500 or llm_s < 1.0 or calls < 3:
         _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
         raise SystemExit(
             f"wall-clock reference probe failed ({tokens} tokens over {llm_s:.1f}s across "

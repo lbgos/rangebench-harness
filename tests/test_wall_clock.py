@@ -615,10 +615,21 @@ class WallClockReferenceTests(unittest.TestCase):
             )
             return AttemptResult(task.id, 1, end_reason="turn budget")
 
+        def failed_end_probe(
+            client: object, task: Task, trial: int, project: str, log_dir: Path, **_kwargs: object
+        ) -> AttemptResult:
+            # Good transcript but the execution failed: must still refuse to start.
+            _write_transcript(
+                log_dir / f"{task.id}-t1.jsonl",
+                [_rec(0.0, "env-up")] + [_llm(20.0 * n, 400) for n in (1, 2, 3)],
+            )
+            return AttemptResult(task.id, 1, end_reason="infra timeout")
+
         cases: list[tuple[str, object, list[str], str, int]] = [
             ("thin transcript", thin_probe, ["sample"], "probe failed .*300 tokens", 1),
             ("attempt raises", RuntimeError("docker down"), ["sample"], "probe attempt failed", 1),
             ("unknown probe task", None, ["sample"], PROBE_ID, 0),
+            ("execution failed probe", failed_end_probe, ["sample"], "infra timeout", 1),
         ]
         for name, effect, run_tasks, message, attempts in cases:
             with (
