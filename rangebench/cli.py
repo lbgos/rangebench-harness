@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .agent import AnthropicChatClient, ChatClient, ChatClientProtocol, Usage
-from .env import TASKS_DIR, load_all, load_task
+from .env import TASKS_DIR, EnvError, load_all, load_task
 from .identity import all_task_identities
 from .runner import (
     DEFAULT_CTX_WINDOW,
@@ -29,12 +29,15 @@ from .runner import (
     classify_end_reason,
     run_attempt,
     run_oracle,
+    transcript_tps,
     wall_clock_scale_for,
 )
 
 RESULTS = Path(__file__).resolve().parent.parent / "results"
 PROBE_MESSAGES = [{"role": "user", "content": "Reply with exactly: COMMAND:\necho ok"}]
 PROBE_MAX_TOKENS = 32768
+# Unscored tier-1 task whose agent attempt measures tokens/sec in reference mode.
+PROBE_TASK = "jwt-none"
 
 
 def _probe_once(client: ChatClientProtocol) -> tuple[float, str, Usage, str | None]:
@@ -363,25 +366,6 @@ def cmd_run(args: argparse.Namespace) -> None:
         doc["model_tps"] = None
     # Fail before spending model calls if the manifest cannot be recorded.
     _write_manifest(log_dir, doc, extra={"status": "running"})
-    model_tps: float | None = None
-    if reference is not None:
-        # One probe call measures generation speed; fail before the run starts.
-        try:
-            elapsed, _content, usage, err = _probe_once(client)
-        except Exception as exc:
-            elapsed, usage, err = 0.0, Usage(), str(exc) or type(exc).__name__
-        if err or usage.completion_tokens <= 0 or elapsed <= 0 or usage.requests > 1:
-            _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
-            if err:
-                reason = f"error: {err}"
-            elif usage.requests > 1:
-                reason = f"{usage.requests} requests; retry backoff skews timing"
-            else:
-                reason = f"{usage.completion_tokens} tokens"
-            raise SystemExit(f"wall-clock reference probe failed ({reason}); run not started")
-        model_tps = usage.completion_tokens / elapsed
-        doc["model_tps"] = model_tps
-        _write_manifest(log_dir, doc, extra={"status": "running"})
 
     def verify_source(completed_attempt: bool = False) -> None:
         current = _source_fingerprint()
@@ -399,6 +383,71 @@ def cmd_run(args: argparse.Namespace) -> None:
                 log_dir, doc, extra={"status": "source_changed", "observed_source": current}
             )
             raise SystemExit("benchmark source changed during run; rerun from a frozen checkout")
+
+    model_tps: float | None = None
+    if reference is not None:
+        # One unscored agent attempt measures generation speed; fail before the run starts.
+        probe_task_id = getattr(args, "wall_clock_probe_task", None) or PROBE_TASK
+        if probe_task_id in task_ids:
+            _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
+            raise SystemExit(
+                f"--wall-clock-probe-task {probe_task_id} is also a run task; its probe "
+                "attempt would overwrite that task's trial-1 transcript"
+            )
+        try:
+            probe_task = load_task(probe_task_id)
+        except EnvError as exc:
+            _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
+            raise SystemExit(f"--wall-clock-probe-task {probe_task_id}: {exc}") from None
+        verify_source()
+        try:
+            probe = run_attempt(
+                client,
+                probe_task,
+                1,
+                f"rb-{probe_task.id}-probe-{uuid.uuid4().hex[:6]}",
+                log_dir,
+                keep=args.keep,
+                ctx_window=args.ctx_window,
+                reserve=args.reserve,
+                keep_tail=args.keep_tail,
+                threshold=args.threshold,
+                use_llm_compact=getattr(args, "compact", "llm") == "llm",
+                attacker_image=attacker_digest,
+                wall_clock_scale=1.0,
+                model_tps=None,
+            )
+        except Exception as exc:
+            _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
+            raise SystemExit(
+                f"wall-clock reference probe attempt failed ({exc or type(exc).__name__}); "
+                "run not started"
+            ) from None
+        try:
+            tokens, llm_s, calls = transcript_tps(log_dir / f"{probe_task.id}-t1.jsonl")
+        except OSError:
+            tokens, llm_s, calls = 0, 0.0, 0
+        if tokens < 500 or llm_s < 1.0 or calls < 3:
+            _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
+            raise SystemExit(
+                f"wall-clock reference probe failed ({tokens} tokens over {llm_s:.1f}s across "
+                f"{calls} calls; need >=500 tokens over >=1s across >=3 calls; attempt ended: "
+                f"{probe.end_reason or 'unknown'}); run not started"
+            )
+        model_tps = tokens / llm_s
+        doc["probe_task"] = probe_task_id
+        doc["probe_attempt"] = {
+            "task": probe_task_id,
+            "solved": sorted(probe.solved) == sorted(s.name for s in probe_task.stages),
+            "end_reason": probe.end_reason,
+            "wall_s": probe.wall_s,
+            "completion_tokens": probe.completion_tokens,
+            "llm_s": round(llm_s, 1),
+            "calls": calls,
+            "model_tps": model_tps,
+        }
+        doc["model_tps"] = model_tps
+        _write_manifest(log_dir, doc, extra={"status": "running"})
 
     for tid in task_ids:
         verify_source()
@@ -691,7 +740,15 @@ def main() -> None:
         default=None,
         metavar="PATH",
         help="reference JSON (reference_tps, tool_share_default, tool_share_by_tier); "
-        "probes the model once and scales each task's cap by its tier's generation share",
+        "runs one unscored probe attempt to measure tokens/sec and scales each task's "
+        "cap by its tier's generation share",
+    )
+    run.add_argument(
+        "--wall-clock-probe-task",
+        default=PROBE_TASK,
+        metavar="TASK",
+        help=f"unscored task attempted once to measure tokens/sec in reference mode, "
+        f"default {PROBE_TASK}; must not be one of the run's tasks",
     )
     run.add_argument("--keep", action="store_true", help="skip teardown (debug)")
     run.add_argument(
