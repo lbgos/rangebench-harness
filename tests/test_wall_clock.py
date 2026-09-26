@@ -615,11 +615,21 @@ class WallClockReferenceTests(unittest.TestCase):
             )
             return AttemptResult(task.id, 1, end_reason="turn budget")
 
+        def failed_end_probe(
+            client: object, task: Task, trial: int, project: str, log_dir: Path, **_kwargs: object
+        ) -> AttemptResult:
+            # Good transcript but the execution failed: must still refuse to start.
+            _write_transcript(
+                log_dir / f"{task.id}-t1.jsonl",
+                [_rec(0.0, "env-up")] + [_llm(20.0 * n, 400) for n in (1, 2, 3)],
+            )
+            return AttemptResult(task.id, 1, end_reason="infra timeout")
+
         cases: list[tuple[str, object, list[str], str, int]] = [
             ("thin transcript", thin_probe, ["sample"], "probe failed .*300 tokens", 1),
             ("attempt raises", RuntimeError("docker down"), ["sample"], "probe attempt failed", 1),
             ("unknown probe task", None, ["sample"], PROBE_ID, 0),
-            ("probe task in run", None, ["sample", PROBE_ID], "also a run task", 0),
+            ("execution failed probe", failed_end_probe, ["sample"], "infra timeout", 1),
         ]
         for name, effect, run_tasks, message, attempts in cases:
             with (
@@ -651,6 +661,42 @@ class WallClockReferenceTests(unittest.TestCase):
                 self.assertNotIn(("sample",), [c.args for c in load_mock.call_args_list])
                 self.assertEqual(manifest["status"], "probe_failed")
                 self.assertFalse((Path(tmp) / "latest.json").exists())
+
+    def test_probe_task_may_overlap_run_task(self) -> None:
+        """The probe transcript is isolated so the probe task may also be scored."""
+
+        def fake_attempt(
+            client: object, task: Task, trial: int, project: str, log_dir: Path, **kwargs: object
+        ) -> AttemptResult:
+            if "probe" in project:
+                _write_transcript(
+                    log_dir / f"{task.id}-t1.jsonl",
+                    [_rec(0.0, "env-up")] + [_llm(20.0 * n, 400) for n in (1, 2, 3)],
+                )
+                return AttemptResult(task.id, 1, solved=["one"], end_reason="solved")
+            _write_transcript(log_dir / f"{task.id}-t1.jsonl", [_rec(0.0, "env-up")])
+            return AttemptResult(task.id, 1, solved=["one"], end_reason="solved")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks = {PROBE_ID: self._probe_task(tmp)}
+            path = self._write_reference(tmp, REFERENCE)
+            with (
+                patch("rangebench.cli.RESULTS", Path(tmp)),
+                patch("rangebench.cli.load_task", side_effect=tasks.__getitem__),
+                patch("rangebench.cli.ChatClient"),
+                patch("rangebench.cli.run_attempt", side_effect=fake_attempt),
+                patch("rangebench.cli._get_attacker_digest", return_value="sha256:test"),
+                patch("rangebench.runner.TaskEnv", FakeEnv),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                cmd_run(self._args(tasks=[PROBE_ID], wall_clock_reference=path))
+            run_dir = next(Path(tmp).glob("*/manifest.json")).parent
+            self.assertTrue((run_dir / "probe" / f"{PROBE_ID}-t1.jsonl").exists())
+            self.assertTrue((run_dir / f"{PROBE_ID}-t1.jsonl").exists())
+            saved = json.loads((Path(tmp) / "latest.json").read_text())
+            self.assertEqual(len(saved["tasks"]), 1)
+            self.assertEqual(saved["tasks"][0]["task"], PROBE_ID)
+            self.assertEqual(saved["probe_task"], PROBE_ID)
 
     def test_manual_mode_recorded(self) -> None:
         task = Task(

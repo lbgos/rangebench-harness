@@ -200,8 +200,9 @@ class TaskEnv:
         self.service_image_fingerprints: dict[str, str] = {}
         self.saved_outputs = 0
 
-    def up(self, build: bool = True) -> None:
-        compose = [
+    def _compose(self) -> list[str]:
+        """The docker compose argv prefix for this attempt's project."""
+        return [
             "docker",
             "compose",
             "-p",
@@ -209,6 +210,9 @@ class TaskEnv:
             "-f",
             str(self.task.dir / self.task.compose),
         ]
+
+    def up(self, build: bool = True) -> None:
+        compose = self._compose()
         services = self._verify_compose_config(compose)
         # Reused project names must not carry old flags or readiness markers.
         _run(["docker", "rm", "-f", self.attacker], check=False, timeout=60)
@@ -522,14 +526,7 @@ class TaskEnv:
         return path
 
     def read_flag(self, stage: Stage) -> str:
-        compose = [
-            "docker",
-            "compose",
-            "-p",
-            self.project,
-            "-f",
-            str(self.task.dir / self.task.compose),
-        ]
+        compose = self._compose()
         proc = _run(
             compose + ["exec", "-T", "-u", "0", stage.service, "cat", stage.flag_file],
             timeout=60,
@@ -543,14 +540,7 @@ class TaskEnv:
         return flag
 
     def logs(self, service: str, tail: int = 50) -> str:
-        compose = [
-            "docker",
-            "compose",
-            "-p",
-            self.project,
-            "-f",
-            str(self.task.dir / self.task.compose),
-        ]
+        compose = self._compose()
         proc = _run(compose + ["logs", "--tail", str(tail), service], timeout=60, check=False)
         return proc.stdout or ""
 
@@ -568,19 +558,7 @@ class TaskEnv:
                 continue
         try:
             _run(
-                [
-                    "docker",
-                    "compose",
-                    "-p",
-                    self.project,
-                    "-f",
-                    str(self.task.dir / self.task.compose),
-                    "down",
-                    "-v",
-                    "--remove-orphans",
-                    "--timeout",
-                    "10",
-                ],
+                self._compose() + ["down", "-v", "--remove-orphans", "--timeout", "10"],
                 check=False,
                 timeout=300,
             )

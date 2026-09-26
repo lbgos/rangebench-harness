@@ -28,7 +28,14 @@ class NetworkIsolationTests(unittest.TestCase):
         }
         unsafe = (
             ({"networks": {"default": {"name": "rb-test_default"}}}, "external access"),
-            ({"networks": {"default": {"name": "rb-test_default", "internal": True, "external": True}}}, "is external"),
+            (
+                {
+                    "networks": {
+                        "default": {"name": "rb-test_default", "internal": True, "external": True}
+                    }
+                },
+                "is external",
+            ),
             ({"networks": {"default": {"name": "shared", "internal": True}}}, "project-scoped"),
             ({"services": {"web": {"network_mode": "host"}}}, "bypasses Compose networks"),
         )
@@ -49,7 +56,10 @@ class NetworkIsolationTests(unittest.TestCase):
         }
         rendered = subprocess.CompletedProcess([], 0, json.dumps(config), "")
         cleared = subprocess.CompletedProcess([], 0, "", "")
-        with patch("rangebench.env._run", side_effect=[rendered, cleared, cleared, EnvError("stop before real Docker")]) as run:
+        with patch(
+            "rangebench.env._run",
+            side_effect=[rendered, cleared, cleared, EnvError("stop before real Docker")],
+        ) as run:
             with self.assertRaisesRegex(EnvError, "stop before real Docker"):
                 self.env.up()
         self.assertEqual(run.call_count, 4)
@@ -65,7 +75,9 @@ class NetworkIsolationTests(unittest.TestCase):
         }
         rendered = subprocess.CompletedProcess([], 0, json.dumps(config), "")
         cleared = subprocess.CompletedProcess([], 0, "", "")
-        with patch("rangebench.env._run", side_effect=[rendered, cleared, EnvError("volume in use")]) as run:
+        with patch(
+            "rangebench.env._run", side_effect=[rendered, cleared, EnvError("volume in use")]
+        ) as run:
             with self.assertRaisesRegex(EnvError, "volume in use"):
                 self.env.up()
         self.assertEqual(run.call_count, 3)
