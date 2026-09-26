@@ -532,7 +532,7 @@ class WallClockReferenceTests(unittest.TestCase):
             ]
         # One startup probe call plus the single agent turn.
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0], 512)
+        self.assertEqual(calls[0], 32768)
         # tier 1 share 0.5: 0.5 + 0.5 * 100/50 = 1.5, so the 30s cap becomes 45s.
         self.assertEqual(saved["tasks"][0]["wall_clock_scale"], 1.5)
         self.assertEqual(saved["model_tps"], 50.0)

@@ -34,7 +34,7 @@ from .runner import (
 
 RESULTS = Path(__file__).resolve().parent.parent / "results"
 PROBE_MESSAGES = [{"role": "user", "content": "Reply with exactly: COMMAND:\necho ok"}]
-PROBE_MAX_TOKENS = 512
+PROBE_MAX_TOKENS = 32768
 
 
 def _probe_once(client: ChatClientProtocol) -> tuple[float, str, Usage, str | None]:
