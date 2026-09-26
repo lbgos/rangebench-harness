@@ -47,9 +47,9 @@ class EnvError(RuntimeError):
 def wall_clock_default(tier: int) -> int:
     """Whole-attempt wall-clock cap in seconds when task.json sets no wall_clock."""
     if tier <= 2:
-        return 600
+        return 600 if tier == 1 else 900
     if tier == 3:
-        return 1200
+        return 1500
     return 1800
 
 

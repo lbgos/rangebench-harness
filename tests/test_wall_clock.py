@@ -70,13 +70,13 @@ class WallClockTests(unittest.TestCase):
     def test_tier_defaults(self) -> None:
         self.assertEqual(
             {tier: wall_clock_default(tier) for tier in (1, 2, 3, 4, 5)},
-            {1: 600, 2: 600, 3: 1200, 4: 1800, 5: 1800},
+            {1: 600, 2: 900, 3: 1500, 4: 1800, 5: 1800},
         )
 
     def test_load_task_defaults_by_tier(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
-            for tier, expected in ((1, 600), (2, 600), (3, 1200), (4, 1800), (5, 1800)):
+            for tier, expected in ((1, 600), (2, 900), (3, 1500), (4, 1800), (5, 1800)):
                 name = f"sample-t{tier}"
                 _write_task_json(base, name, tier)
                 with (
