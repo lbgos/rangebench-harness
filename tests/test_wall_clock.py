@@ -10,7 +10,24 @@ from unittest.mock import patch
 from rangebench.agent import Usage
 from rangebench.cli import cmd_probe, cmd_run, main
 from rangebench.env import ATTACKER_IMAGE, EnvError, Stage, Task, load_task, wall_clock_default
-from rangebench.runner import AttemptResult, run_attempt, wall_clock_scale_for
+from rangebench.runner import AttemptResult, run_attempt, transcript_tps, wall_clock_scale_for
+
+PROBE_ID = "jwt-none"
+
+
+def _rec(t: float, kind: str, **kv: object) -> dict:
+    return {"t": t, "kind": kind, **kv}
+
+
+def _llm(t: float, tokens: int, requests: int = 1, error: str | None = None) -> dict:
+    usage = {"completion_tokens": tokens, "requests": requests, "error": error}
+    return _rec(t, "llm-call", usage=usage)
+
+
+def _write_transcript(path: Path, records: list[dict | str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [r if isinstance(r, str) else json.dumps(r) for r in records]
+    path.write_text("".join(line + "\n" for line in lines))
 
 
 class FakeEnv:
@@ -488,6 +505,11 @@ class WallClockReferenceTests(unittest.TestCase):
                 )
                 cmd_run(self._args(wall_clock_reference=path))
 
+    def _probe_task(self, tmp: str) -> Task:
+        return Task(
+            PROBE_ID, Path(tmp), "web", 1, "Find the flag", stages=[Stage("one", "/flag", "target")]
+        )
+
     def test_reference_run_scales_cap_per_task(self) -> None:
         calls: list[int] = []
 
@@ -501,7 +523,20 @@ class WallClockReferenceTests(unittest.TestCase):
                 calls.append(max_tokens)
                 return "COMMAND:\ntrue", Usage(completion_tokens=50), None
 
-        clock = iter([10.0, 11.0])  # the startup probe takes 1s: 50 tok/s
+        def fake_attempt(
+            client: object, task: Task, trial: int, project: str, log_dir: Path, **kwargs: object
+        ) -> AttemptResult:
+            if task.id != PROBE_ID:
+                return run_attempt(client, task, trial, project, log_dir, **kwargs)  # type: ignore[arg-type]
+            # Three usable calls of 400 tokens at 20s gaps: 1200 tokens over 60s = 20 tok/s.
+            _write_transcript(
+                log_dir / f"{PROBE_ID}-t1.jsonl",
+                [_rec(0.0, "env-up")] + [_llm(20.0 * n, 400) for n in (1, 2, 3)],
+            )
+            return AttemptResult(
+                PROBE_ID, 1, solved=["one"], end_reason="solved", completion_tokens=1200
+            )
+
         with tempfile.TemporaryDirectory() as tmp:
             task = Task(
                 "sample",
@@ -513,13 +548,14 @@ class WallClockReferenceTests(unittest.TestCase):
                 turns=1,
                 wall_clock=30,
             )
+            tasks = {PROBE_ID: self._probe_task(tmp), "sample": task}
             path = self._write_reference(tmp, REFERENCE)
             with (
                 patch("rangebench.cli.RESULTS", Path(tmp)),
-                patch("rangebench.cli.load_task", return_value=task),
+                patch("rangebench.cli.load_task", side_effect=tasks.__getitem__),
                 patch("rangebench.cli.ChatClient", CountingClient),
+                patch("rangebench.cli.run_attempt", side_effect=fake_attempt) as attempt,
                 patch("rangebench.runner.TaskEnv", FakeEnv),
-                patch("rangebench.cli.time.perf_counter", side_effect=lambda: next(clock)),
                 patch("rangebench.cli._get_attacker_digest", return_value="sha256:test"),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
@@ -530,51 +566,91 @@ class WallClockReferenceTests(unittest.TestCase):
                 json.loads(line)
                 for line in next(Path(tmp).glob("*/sample-t1.jsonl")).read_text().splitlines()
             ]
-        # One startup probe call plus the single agent turn.
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0], 32768)
-        # tier 1 share 0.5: 0.5 + 0.5 * 100/50 = 1.5, so the 30s cap becomes 45s.
-        self.assertEqual(saved["tasks"][0]["wall_clock_scale"], 1.5)
-        self.assertEqual(saved["model_tps"], 50.0)
+        # The probe attempt is faked, so the model is called once: the agent turn.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(attempt.call_count, 2)
+        probe_kwargs = attempt.call_args_list[0].kwargs
+        self.assertEqual(probe_kwargs["wall_clock_scale"], 1.0)
+        self.assertIsNone(probe_kwargs["model_tps"])
+        # tier 1 share 0.5: 0.5 + 0.5 * 100/20 = 3.0, so the 30s cap becomes 90s.
+        self.assertEqual(len(saved["tasks"]), 1)  # the probe attempt is not scored
+        self.assertEqual(saved["tasks"][0]["task"], "sample")
+        self.assertEqual(saved["tasks"][0]["wall_clock_scale"], 3.0)
+        self.assertEqual(saved["model_tps"], 20.0)
+        self.assertEqual(saved["probe_task"], PROBE_ID)
+        self.assertEqual(
+            saved["probe_attempt"],
+            {
+                "task": PROBE_ID,
+                "solved": True,
+                "end_reason": "solved",
+                "wall_s": 0.0,
+                "completion_tokens": 1200,
+                "llm_s": 60.0,
+                "calls": 3,
+                "model_tps": 20.0,
+            },
+        )
         self.assertEqual(saved["wall_clock_reference"], path)
         self.assertEqual(saved["wall_clock_scale_mode"], "reference")
         self.assertEqual(manifest["wall_clock_reference"], path)
+        self.assertEqual(manifest["model_tps"], 20.0)
+        self.assertEqual(manifest["task_count"], 1)
         end = next(r for r in records if r["kind"] == "end")
-        self.assertEqual(end["wall_clock_seconds"], 45)
+        self.assertEqual(end["wall_clock_seconds"], 90)
         config = [r for r in records if r["kind"] == "budget-config"]
         self.assertEqual(len(config), 1)
         self.assertEqual(config[0]["tier"], 1)
-        self.assertEqual(config[0]["wall_clock_scale"], 1.5)
-        self.assertEqual(config[0]["model_tps"], 50.0)
+        self.assertEqual(config[0]["wall_clock_scale"], 3.0)
+        self.assertEqual(config[0]["model_tps"], 20.0)
 
     def test_failed_probe_exits_before_run(self) -> None:
-        for usage, err in (
-            (Usage(completion_tokens=50), "HTTP 500"),
-            (Usage(), None),
-            (Usage(completion_tokens=50, requests=3), None),
-        ):
+        def thin_probe(
+            client: object, task: Task, trial: int, project: str, log_dir: Path, **_kwargs: object
+        ) -> AttemptResult:
+            # Two usable calls, 300 tokens: below every floor but the 1s one.
+            _write_transcript(
+                log_dir / f"{task.id}-t1.jsonl",
+                [_rec(0.0, "env-up"), _llm(10.0, 150), _llm(20.0, 150)],
+            )
+            return AttemptResult(task.id, 1, end_reason="turn budget")
 
-            class FailingClient:
-                def __init__(self, *_args: object, **_kwargs: object) -> None:
-                    pass
-
-                def chat(self, *_args: object, **_kwargs: object) -> tuple[str, Usage, str | None]:
-                    return "", usage, err
-
+        cases: list[tuple[str, object, list[str], str, int]] = [
+            ("thin transcript", thin_probe, ["sample"], "probe failed .*300 tokens", 1),
+            ("attempt raises", RuntimeError("docker down"), ["sample"], "probe attempt failed", 1),
+            ("unknown probe task", None, ["sample"], PROBE_ID, 0),
+            ("probe task in run", None, ["sample", PROBE_ID], "also a run task", 0),
+        ]
+        for name, effect, run_tasks, message, attempts in cases:
             with (
-                self.subTest(err=err),
+                self.subTest(name),
                 tempfile.TemporaryDirectory() as tmp,
-                patch("rangebench.cli.RESULTS", Path(tmp)),
-                patch("rangebench.cli.ChatClient", FailingClient),
-                patch("rangebench.cli.run_attempt") as attempt,
-                patch("rangebench.cli._get_attacker_digest", return_value="sha256:test"),
             ):
+                tasks = {} if name == "unknown probe task" else {PROBE_ID: self._probe_task(tmp)}
+
+                def load(tid: str, tasks: dict[str, Task] = tasks) -> Task:
+                    if tid not in tasks:
+                        raise EnvError(f"unknown task {tid}")
+                    return tasks[tid]
+
                 path = self._write_reference(tmp, REFERENCE)
-                with self.assertRaisesRegex(SystemExit, "probe failed"):
-                    cmd_run(self._args(wall_clock_reference=path))
+                with (
+                    patch("rangebench.cli.RESULTS", Path(tmp)),
+                    patch("rangebench.cli.ChatClient") as client_cls,
+                    patch("rangebench.cli.load_task", side_effect=load) as load_mock,
+                    patch("rangebench.cli.run_attempt", side_effect=effect) as attempt,
+                    patch("rangebench.cli._get_attacker_digest", return_value="sha256:test"),
+                    self.assertRaisesRegex(SystemExit, message),
+                ):
+                    cmd_run(self._args(tasks=run_tasks, wall_clock_reference=path))
                 manifest = json.loads(next(Path(tmp).glob("*/manifest.json")).read_text())
-                attempt.assert_not_called()
+                client_cls.return_value.chat.assert_not_called()
+                self.assertEqual(attempt.call_count, attempts)
+                if attempts:
+                    self.assertEqual(attempt.call_args.args[1].id, PROBE_ID)
+                self.assertNotIn(("sample",), [c.args for c in load_mock.call_args_list])
                 self.assertEqual(manifest["status"], "probe_failed")
+                self.assertFalse((Path(tmp) / "latest.json").exists())
 
     def test_manual_mode_recorded(self) -> None:
         task = Task(
@@ -584,19 +660,103 @@ class WallClockReferenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 patch("rangebench.cli.RESULTS", Path(tmp)),
-                patch("rangebench.cli.load_task", return_value=task),
+                patch("rangebench.cli.load_task", return_value=task) as load_mock,
                 patch("rangebench.cli.ChatClient") as client_cls,
-                patch("rangebench.cli.run_attempt", return_value=result),
+                patch("rangebench.cli.run_attempt", return_value=result) as attempt,
                 patch("rangebench.cli._get_attacker_digest", return_value="sha256:test"),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 cmd_run(self._args(wall_clock_scale=2.0))
             saved = json.loads((Path(tmp) / "latest.json").read_text())
         client_cls.return_value.chat.assert_not_called()  # no startup probe in manual mode
+        load_mock.assert_called_once_with("sample")  # the probe task is never touched
+        attempt.assert_called_once()
+        self.assertNotIn("probe_task", saved)
+        self.assertNotIn("probe_attempt", saved)
         self.assertEqual(saved["wall_clock_scale_mode"], "manual")
         self.assertEqual(saved["wall_clock_scale"], 2.0)
         self.assertEqual(saved["tasks"][0]["wall_clock_scale"], 2.0)
         self.assertNotIn("model_tps", saved)
+
+
+class TranscriptTpsTests(unittest.TestCase):
+    def _tps(self, records: list[dict | str]) -> tuple[int, float, int]:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.jsonl"
+            _write_transcript(path, records)
+            return transcript_tps(path)
+
+    def test_usable_gaps_accumulate(self) -> None:
+        records: list[dict | str] = [
+            _rec(0.0, "env-up"),
+            _llm(10.0, 100),
+            _rec(12.0, "exec", cmd="id"),
+            _llm(20.0, 200),
+            _llm(25.0, 50),
+        ]
+        self.assertEqual(self._tps(records), (350, 23.0, 3))
+
+    def test_first_call_without_previous_record_is_skipped(self) -> None:
+        self.assertEqual(self._tps([_llm(10.0, 100), _llm(15.0, 50)]), (50, 5.0, 1))
+
+    def test_errored_call_and_the_call_after_it_excluded(self) -> None:
+        for name, failed in (
+            ("usage error", _llm(15.0, 0, error="HTTP 500")),
+            ("record error", _rec(15.0, "llm-call", usage=_llm(0, 0)["usage"], error="HTTP 500")),
+        ):
+            records: list[dict | str] = [
+                _rec(0.0, "env-up"),
+                _llm(10.0, 100),
+                failed,
+                _llm(25.0, 100),  # its gap spans the failed call
+                _llm(30.0, 50),
+            ]
+            with self.subTest(name):
+                self.assertEqual(self._tps(records), (150, 15.0, 2))
+
+    def test_retried_call_excluded(self) -> None:
+        records: list[dict | str] = [
+            _rec(0.0, "env-up"),
+            _llm(10.0, 100, requests=2),
+            _llm(20.0, 100),  # the previous call retried
+            _llm(24.0, 40),
+        ]
+        self.assertEqual(self._tps(records), (40, 4.0, 1))
+
+    def test_long_gap_skipped_but_updates_previous_t(self) -> None:
+        for gap in (180.0, 200.0):
+            records: list[dict | str] = [_rec(0.0, "env-up"), _llm(gap, 999), _llm(gap + 10, 70)]
+            with self.subTest(gap=gap):
+                self.assertEqual(self._tps(records), (70, 10.0, 1))
+
+    def test_non_positive_gap_skipped(self) -> None:
+        records: list[dict | str] = [_rec(5.0, "env-up"), _llm(5.0, 100), _llm(9.0, 40)]
+        self.assertEqual(self._tps(records), (40, 4.0, 1))
+
+    def test_non_llm_record_resets_ok_flag(self) -> None:
+        records: list[dict | str] = [
+            _rec(0.0, "env-up"),
+            _llm(5.0, 0, error="HTTP 500"),
+            _rec(6.0, "exec", cmd="id"),
+            _llm(10.0, 80),
+        ]
+        self.assertEqual(self._tps(records), (80, 4.0, 1))
+
+    def test_record_without_t_keeps_previous_t_and_resets_ok_flag(self) -> None:
+        records: list[dict | str] = [
+            _rec(0.0, "env-up"),
+            _llm(5.0, 0, error="HTTP 500"),
+            {"kind": "exec"},
+            _llm(10.0, 80),
+        ]
+        self.assertEqual(self._tps(records), (80, 5.0, 1))
+
+    def test_malformed_json_skipped(self) -> None:
+        records: list[dict | str] = [_rec(0.0, "env-up"), "{not json", "", _llm(10.0, 60)]
+        self.assertEqual(self._tps(records), (60, 10.0, 1))
+
+    def test_empty_file(self) -> None:
+        self.assertEqual(self._tps([]), (0, 0.0, 0))
 
 
 class ProbeTests(unittest.TestCase):
