@@ -400,7 +400,6 @@ def _measure_model_tps(
     args: argparse.Namespace,
     client: ChatClientProtocol,
     doc: dict,
-    task_ids: list[str],
     log_dir: Path,
     attacker_digest: str,
     verify_source: Callable[[], None],
@@ -408,21 +407,17 @@ def _measure_model_tps(
     """Run one unscored probe attempt and return the model's tokens/sec.
 
     Records the probe in doc; on any failure writes a probe_failed manifest and
-    exits before the run starts.
+    exits before the run starts. The probe transcript lives in log_dir/probe so
+    the probe task may also be a run task without overwriting trial transcripts.
     """
     probe_task_id = getattr(args, "wall_clock_probe_task", None) or PROBE_TASK
-    if probe_task_id in task_ids:
-        _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
-        raise SystemExit(
-            f"--wall-clock-probe-task {probe_task_id} is also a run task; its probe "
-            "attempt would overwrite that task's trial-1 transcript"
-        )
     try:
         probe_task = load_task(probe_task_id)
     except EnvError as exc:
         _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
         raise SystemExit(f"--wall-clock-probe-task {probe_task_id}: {exc}") from None
     verify_source()
+    probe_dir = log_dir / "probe"
     try:
         probe = _attempt(
             args,
@@ -430,7 +425,7 @@ def _measure_model_tps(
             probe_task,
             1,
             f"rb-{probe_task.id}-probe-{uuid.uuid4().hex[:6]}",
-            log_dir,
+            probe_dir,
             attacker_digest,
             1.0,
             None,
@@ -442,7 +437,7 @@ def _measure_model_tps(
             "run not started"
         ) from None
     try:
-        tokens, llm_s, calls = transcript_tps(log_dir / f"{probe_task.id}-t1.jsonl")
+        tokens, llm_s, calls = transcript_tps(probe_dir / f"{probe_task.id}-t1.jsonl")
     except OSError:
         tokens, llm_s, calls = 0, 0.0, 0
     if tokens < 500 or llm_s < 1.0 or calls < 3:
@@ -616,9 +611,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     model_tps: float | None = None
     if reference is not None:
         # One unscored agent attempt measures generation speed; fail before the run starts.
-        model_tps = _measure_model_tps(
-            args, client, doc, task_ids, log_dir, attacker_digest, verify_source
-        )
+        model_tps = _measure_model_tps(args, client, doc, log_dir, attacker_digest, verify_source)
         _write_manifest(log_dir, doc, extra={"status": "running"})
 
     for tid in task_ids:
@@ -788,7 +781,7 @@ def main() -> None:
         default=PROBE_TASK,
         metavar="TASK",
         help=f"unscored task attempted once to measure tokens/sec in reference mode, "
-        f"default {PROBE_TASK}; must not be one of the run's tasks",
+        f"default {PROBE_TASK}; its transcript is isolated so it may overlap run tasks",
     )
     run.add_argument("--keep", action="store_true", help="skip teardown (debug)")
     run.add_argument(
