@@ -258,7 +258,7 @@ class CompactionTests(unittest.TestCase):
         self.assertIn("EARLY_MARKER", compacted[2]["content"])
         self.assertIn("LATE_MARKER", compacted[2]["content"])
         self.assertEqual(tokens.prompt_tokens + tokens.completion_tokens, 110 * len(client.calls))
-        for call, limit in zip(client.calls, client.limits):
+        for call, limit in zip(client.calls, client.limits, strict=False):
             self.assertLess(_estimate_tokens(call) * 2 + limit, 8000)
 
     def test_first_chunk_fact_survives_model_that_forgets_prior_summary(self) -> None:

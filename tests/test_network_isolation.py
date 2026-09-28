@@ -17,9 +17,11 @@ class NetworkIsolationTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "rb-test_default\nrb-test_core\n", ""),
             subprocess.CompletedProcess([], 0, "false\n", ""),
         ]
-        with patch("rangebench.env._run", side_effect=responses):
-            with self.assertRaisesRegex(EnvError, "allows external access"):
-                self.env.verify_isolation(["rb-test_default"])
+        with (
+            patch("rangebench.env._run", side_effect=responses),
+            self.assertRaisesRegex(EnvError, "allows external access"),
+        ):
+            self.env.verify_isolation(["rb-test_default"])
 
     def test_compose_escape_is_rejected_before_up(self) -> None:
         safe = {
@@ -43,9 +45,11 @@ class NetworkIsolationTests(unittest.TestCase):
             with self.subTest(error=error):
                 config = safe | change
                 rendered = subprocess.CompletedProcess([], 0, json.dumps(config), "")
-                with patch("rangebench.env._run", return_value=rendered) as run:
-                    with self.assertRaisesRegex(EnvError, error):
-                        self.env.up()
+                with (
+                    patch("rangebench.env._run", return_value=rendered) as run,
+                    self.assertRaisesRegex(EnvError, error),
+                ):
+                    self.env.up()
                 self.assertEqual(run.call_count, 1)
                 self.assertEqual(run.call_args.args[0][-3:], ["config", "--format", "json"])
 
@@ -56,12 +60,14 @@ class NetworkIsolationTests(unittest.TestCase):
         }
         rendered = subprocess.CompletedProcess([], 0, json.dumps(config), "")
         cleared = subprocess.CompletedProcess([], 0, "", "")
-        with patch(
-            "rangebench.env._run",
-            side_effect=[rendered, cleared, cleared, EnvError("stop before real Docker")],
-        ) as run:
-            with self.assertRaisesRegex(EnvError, "stop before real Docker"):
-                self.env.up()
+        with (
+            patch(
+                "rangebench.env._run",
+                side_effect=[rendered, cleared, cleared, EnvError("stop before real Docker")],
+            ) as run,
+            self.assertRaisesRegex(EnvError, "stop before real Docker"),
+        ):
+            self.env.up()
         self.assertEqual(run.call_count, 4)
         self.assertEqual(run.call_args_list[0].args[0][-3:], ["config", "--format", "json"])
         self.assertEqual(run.call_args_list[1].args[0], ["docker", "rm", "-f", "rb-test-atk"])
@@ -75,11 +81,13 @@ class NetworkIsolationTests(unittest.TestCase):
         }
         rendered = subprocess.CompletedProcess([], 0, json.dumps(config), "")
         cleared = subprocess.CompletedProcess([], 0, "", "")
-        with patch(
-            "rangebench.env._run", side_effect=[rendered, cleared, EnvError("volume in use")]
-        ) as run:
-            with self.assertRaisesRegex(EnvError, "volume in use"):
-                self.env.up()
+        with (
+            patch(
+                "rangebench.env._run", side_effect=[rendered, cleared, EnvError("volume in use")]
+            ) as run,
+            self.assertRaisesRegex(EnvError, "volume in use"),
+        ):
+            self.env.up()
         self.assertEqual(run.call_count, 3)
         self.assertEqual(run.call_args.args[0][-3:], ["down", "-v", "--remove-orphans"])
 

@@ -10,7 +10,6 @@ from __future__ import annotations
 import contextlib
 import json
 import re
-import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -293,7 +292,7 @@ class ChatClient:
         )
         last_err: Exception | None = None
         usage = Usage()
-        for attempt in range(4):
+        for _ in range(1):
             usage.requests += 1
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
@@ -338,13 +337,8 @@ class ChatClient:
                 last_err = RuntimeError(f"HTTP {exc.code}: {detail}")
                 if exc.code in (400, 401, 403, 404):
                     return ChatResult("", usage, str(last_err), metadata)
-                if exc.code in (408, 413, 429, 500, 502, 503, 504, 529):
-                    time.sleep(min(2**attempt * 2, 30))
-                    continue
-                time.sleep(min(2**attempt * 2, 30))
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
-                time.sleep(min(2**attempt * 2, 30))
         return ChatResult("", usage, f"transport: {last_err}", metadata)
 
 
@@ -394,7 +388,7 @@ class AnthropicChatClient:
         )
         last_err: Exception | None = None
         usage = Usage()
-        for attempt in range(4):
+        for _ in range(1):
             usage.requests += 1
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
@@ -432,10 +426,8 @@ class AnthropicChatClient:
                 last_err = RuntimeError(f"HTTP {exc.code}: {detail}")
                 if exc.code in (400, 401, 403, 404):
                     return ChatResult("", usage, str(last_err), metadata)
-                time.sleep(min(2**attempt * 2, 30))
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
-                time.sleep(min(2**attempt * 2, 30))
         return ChatResult("", usage, f"transport: {last_err}", metadata)
 
 

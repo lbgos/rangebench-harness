@@ -113,11 +113,17 @@ class WallClockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             _write_task_json(base, "sample", 1, {"wall_clock": 0})
-            with patch("rangebench.env.TASKS_DIR", base):
-                with self.assertRaisesRegex(EnvError, "wall_clock"):
-                    load_task("sample")
+            with (
+                patch("rangebench.env.TASKS_DIR", base),
+                self.assertRaisesRegex(EnvError, "wall_clock"),
+            ):
+                load_task("sample")
 
     def test_real_tasks_get_tier_defaults(self) -> None:
+        from rangebench.env import TASKS_DIR
+
+        if not TASKS_DIR.is_dir():
+            self.skipTest("release tasks are not present in this checkout")
         self.assertEqual(load_task("jwt-none").wall_clock, 600)
 
     def test_expired_cap_ends_attempt_before_any_model_call(self) -> None:
@@ -559,8 +565,9 @@ class WallClockReferenceTests(unittest.TestCase):
                 patch("rangebench.cli._get_attacker_digest", return_value="sha256:test"),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
-                cmd_run(self._args(wall_clock_reference=path))
+                cmd_run(self._args(wall_clock_reference=path, max_attempts=2))
             saved = json.loads((Path(tmp) / "latest.json").read_text())
+            live = next(Path(tmp).glob("*/live.log")).read_text()
             manifest = json.loads(next(Path(tmp).glob("*/manifest.json")).read_text())
             records = [
                 json.loads(line)
@@ -596,6 +603,9 @@ class WallClockReferenceTests(unittest.TestCase):
         self.assertEqual(manifest["wall_clock_reference"], path)
         self.assertEqual(manifest["model_tps"], 20.0)
         self.assertEqual(manifest["task_count"], 1)
+        self.assertEqual(manifest["status"], "completed")
+        self.assertIn("attempts 1/2 · reference probe started", live)
+        self.assertIn("attempts 2/2 · sample t1 · started", live)
         end = next(r for r in records if r["kind"] == "end")
         self.assertEqual(end["wall_clock_seconds"], 90)
         config = [r for r in records if r["kind"] == "budget-config"]

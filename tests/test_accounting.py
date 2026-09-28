@@ -1,9 +1,9 @@
 import argparse
 import errno
 import json
-import tempfile
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -185,9 +185,9 @@ class AccountingTests(unittest.TestCase):
                         service_image_fingerprints={"api": "sha256:" + "b" * 64},
                     ),
                 ) as attempt,
+                self.assertRaisesRegex(SystemExit, "source changed"),
             ):
-                with self.assertRaisesRegex(SystemExit, "source changed"):
-                    cmd_run(args)
+                cmd_run(args)
             self.assertEqual(attempt.call_count, 1)
             manifest = json.loads(next(Path(tmp).glob("*/manifest.json")).read_text())
             saved = json.loads((Path(tmp) / "latest.json").read_text())["tasks"][0]
@@ -351,20 +351,24 @@ class AccountingTests(unittest.TestCase):
         self.assertNotEqual(original, changed)
 
     def test_docker_timeout_is_an_environment_error(self) -> None:
-        with patch(
-            "rangebench.env.subprocess.run", side_effect=subprocess.TimeoutExpired("docker", 1)
+        with (
+            patch(
+                "rangebench.env.subprocess.run", side_effect=subprocess.TimeoutExpired("docker", 1)
+            ),
+            self.assertRaisesRegex(EnvError, "timed out after 1s"),
         ):
-            with self.assertRaisesRegex(EnvError, "timed out after 1s"):
-                _run(["docker", "compose", "up"], timeout=1)
+            _run(["docker", "compose", "up"], timeout=1)
 
     def test_docker_daemon_outage_is_not_a_model_command_failure(self) -> None:
         task = Task("sample", Path("/tmp"), "web", 1, "Find the flag")
         env = TaskEnv(task, "rb-test")
         exec_failure = subprocess.CompletedProcess([], 1, "", "Cannot connect to the Docker daemon")
         probe_failure = subprocess.CompletedProcess([], 1, "", "daemon unavailable")
-        with patch("rangebench.env.subprocess.run", side_effect=[exec_failure, probe_failure]):
-            with self.assertRaisesRegex(EnvError, "Docker exec failed"):
-                env.exec("echo ok")
+        with (
+            patch("rangebench.env.subprocess.run", side_effect=[exec_failure, probe_failure]),
+            self.assertRaisesRegex(EnvError, "Docker exec failed"),
+        ):
+            env.exec("echo ok")
 
     def test_dead_attacker_container_is_not_a_model_command_failure(self) -> None:
         task = Task("sample", Path("/tmp"), "web", 1, "Find the flag")
@@ -373,9 +377,11 @@ class AccountingTests(unittest.TestCase):
             [], 1, "", "Error response from daemon: Container rb-test-atk is not running"
         )
         probe_failure = subprocess.CompletedProcess([], 1, "", "container not running")
-        with patch("rangebench.env.subprocess.run", side_effect=[failure, probe_failure]):
-            with self.assertRaisesRegex(EnvError, "Docker exec failed"):
-                env.exec("echo ok")
+        with (
+            patch("rangebench.env.subprocess.run", side_effect=[failure, probe_failure]),
+            self.assertRaisesRegex(EnvError, "Docker exec failed"),
+        ):
+            env.exec("echo ok")
 
     def test_model_stderr_that_looks_like_docker_error_is_scored(self) -> None:
         task = Task("sample", Path("/tmp"), "web", 1, "Find the flag")
@@ -436,9 +442,11 @@ class AccountingTests(unittest.TestCase):
     def test_other_subprocess_start_error_invalidates_attempt(self) -> None:
         task = Task("sample", Path("/tmp"), "web", 1, "Find the flag")
         env = TaskEnv(task, "rb-test")
-        with patch("rangebench.env.subprocess.run", side_effect=OSError(errno.ENOENT, "missing")):
-            with self.assertRaisesRegex(EnvError, "Docker exec could not start"):
-                env.exec("echo ok")
+        with (
+            patch("rangebench.env.subprocess.run", side_effect=OSError(errno.ENOENT, "missing")),
+            self.assertRaisesRegex(EnvError, "Docker exec could not start"),
+        ):
+            env.exec("echo ok")
 
     def test_attacker_uses_recorded_image_id(self) -> None:
         task = Task("sample", Path("/tmp"), "web", 1, "Find the flag")
@@ -477,17 +485,21 @@ class AccountingTests(unittest.TestCase):
             run.call_args.args[0], ["docker", "inspect", "--format", "{{.Image}}", "container-2"]
         )
 
-        with patch("rangebench.env._run", return_value=subprocess.CompletedProcess([], 0, "", "")):
-            with self.assertRaisesRegex(EnvError, "no container for service api"):
-                env.inspect_service_images(["docker", "compose"], ["api"])
+        with (
+            patch("rangebench.env._run", return_value=subprocess.CompletedProcess([], 0, "", "")),
+            self.assertRaisesRegex(EnvError, "no container for service api"),
+        ):
+            env.inspect_service_images(["docker", "compose"], ["api"])
 
         bad = [
             subprocess.CompletedProcess([], 0, "container-1\n", ""),
             subprocess.CompletedProcess([], 0, "nginx:latest\n", ""),
         ]
-        with patch("rangebench.env._run", side_effect=bad):
-            with self.assertRaisesRegex(EnvError, "invalid image ID for service api"):
-                env.inspect_service_images(["docker", "compose"], ["api"])
+        with (
+            patch("rangebench.env._run", side_effect=bad),
+            self.assertRaisesRegex(EnvError, "invalid image ID for service api"),
+        ):
+            env.inspect_service_images(["docker", "compose"], ["api"])
 
     def test_image_fingerprint_ignores_only_compose_project_label(self) -> None:
         image = {
@@ -641,23 +653,27 @@ class AccountingTests(unittest.TestCase):
         task = Task("sample", Path("/tmp"), "web", 1, "Find the flag")
         env = TaskEnv(task, "rb-test")
         failed_probe = subprocess.CompletedProcess([], 1, "", "container not running")
-        with patch(
-            "rangebench.env.subprocess.run",
-            side_effect=[subprocess.TimeoutExpired("docker exec", 1), failed_probe],
+        with (
+            patch(
+                "rangebench.env.subprocess.run",
+                side_effect=[subprocess.TimeoutExpired("docker exec", 1), failed_probe],
+            ),
+            self.assertRaisesRegex(EnvError, "Docker exec unavailable"),
         ):
-            with self.assertRaisesRegex(EnvError, "Docker exec unavailable"):
-                env.exec("sleep 10", timeout=1)
+            env.exec("sleep 10", timeout=1)
 
     def test_outer_timeout_is_invalid_even_when_attacker_responds(self) -> None:
         task = Task("sample", Path("/tmp"), "web", 1, "Find the flag")
         env = TaskEnv(task, "rb-test")
         healthy_probe = subprocess.CompletedProcess([], 0, "", "")
-        with patch(
-            "rangebench.env.subprocess.run",
-            side_effect=[subprocess.TimeoutExpired("docker exec", 16), healthy_probe],
+        with (
+            patch(
+                "rangebench.env.subprocess.run",
+                side_effect=[subprocess.TimeoutExpired("docker exec", 16), healthy_probe],
+            ),
+            self.assertRaisesRegex(EnvError, "did not finish"),
         ):
-            with self.assertRaisesRegex(EnvError, "did not finish"):
-                env.exec("sleep 10", timeout=1)
+            env.exec("sleep 10", timeout=1)
 
     def test_invalid_trial_exits_nonzero_after_writing_artifacts(self) -> None:
         task = Task(
@@ -706,9 +722,9 @@ class AccountingTests(unittest.TestCase):
                     return_value=result,
                 ) as run_attempt,
                 patch("rangebench.cli._get_attacker_digest", return_value="sha256:test"),
+                self.assertRaises(SystemExit) as caught,
             ):
-                with self.assertRaises(SystemExit) as caught:
-                    cmd_run(args)
+                cmd_run(args)
             self.assertEqual(caught.exception.code, 1)
             self.assertEqual(run_attempt.call_args.kwargs["attacker_image"], "sha256:test")
             saved = json.loads((Path(tmp) / "latest.json").read_text())["tasks"][0]

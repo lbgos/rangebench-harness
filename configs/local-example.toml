@@ -1,0 +1,7 @@
+display_name = "Local example"
+base_url = "http://localhost:8000/v1"
+api_key_env = "RANGEBENCH_LOCAL_API_KEY"
+model = "replace-with-model-id"
+ctx_window = 128000
+trials = 2
+notes = "Replace the model ID and set the named environment variable before launch."
