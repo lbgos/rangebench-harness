@@ -148,8 +148,8 @@ def main() -> None:
     args = parser.parse_args()
     try:
         result = stage_import(
-            json.loads(args.leaderboard.read_text()),
-            json.loads(args.submission.read_text()),
+            json.loads(args.leaderboard.read_text(encoding="utf-8")),
+            json.loads(args.submission.read_text(encoding="utf-8")),
             allow_partial=args.allow_partial,
             allow_source_change=args.allow_source_change,
         )
