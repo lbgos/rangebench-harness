@@ -53,6 +53,7 @@ RUN_TEMPLATE = """\
 # never put a key on the command line.
 set -eu
 kit=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$kit"
 PYTHONPATH="$kit"
 export PYTHONPATH
 exec python3 -P -m rangebench run {ids} "$@"
