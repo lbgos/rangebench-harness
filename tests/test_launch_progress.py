@@ -233,7 +233,7 @@ class LaunchProgressTests(unittest.TestCase):
                 patch("rangebench.cli.RESULTS", root),
                 patch("rangebench.cli.load_task", return_value=task),
                 patch("rangebench.cli.ChatClient"),
-                patch("rangebench.cli._get_attacker_digest", return_value="sha256:test"),
+                patch("rangebench.cli._get_attacker_digest", return_value="sha256:" + "a" * 64),
                 patch(
                     "rangebench.cli.run_attempt",
                     return_value=AttemptResult(task.id, 1, end_reason="turn budget"),
@@ -241,6 +241,9 @@ class LaunchProgressTests(unittest.TestCase):
                 contextlib.redirect_stdout(stdout),
             ):
                 cmd_run(args)
+            submission = json.loads(next(root.glob("*/submission.json")).read_text())
+            self.assertEqual(submission["summary"]["missing_slots"], 2)
+            self.assertEqual(submission["summary"]["scored"], 1)
             self.assertEqual(attempt.call_count, 1)
             status = json.loads(args.status_json.read_text())
             self.assertEqual(status["model_attempts_used"], 1)

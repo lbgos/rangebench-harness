@@ -866,18 +866,15 @@ def cmd_run(args: argparse.Namespace) -> None:
     _write_manifest(log_dir, doc, extra={"status": state})
     progress.finish(state)
     _write_report_html(log_dir, doc)
-    if state != "attempt_limit":
-        try:
-            key_names = (getattr(args, "api_key_env", None), "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
-            credentials = tuple(
-                os.environ[name] for name in key_names if name and os.environ.get(name)
-            )
-            submission = build_submission(doc, sensitive_values=credentials)
-            submission_path = log_dir / "submission.json"
-            submission_path.write_text(json.dumps(submission, indent=2, allow_nan=False) + "\n")
-            print(f"wrote {submission_path}")
-        except (ValueError, KeyError, TypeError):
-            print("[warn] safe submission could not be generated; raw run was preserved")
+    try:
+        key_names = (getattr(args, "api_key_env", None), "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+        credentials = tuple(os.environ[name] for name in key_names if name and os.environ.get(name))
+        submission = build_submission(doc, sensitive_values=credentials)
+        submission_path = log_dir / "submission.json"
+        submission_path.write_text(json.dumps(submission, indent=2, allow_nan=False) + "\n")
+        print(f"wrote {submission_path}")
+    except (OSError, ValueError, KeyError, TypeError):
+        print("[warn] safe submission could not be generated; raw run was preserved")
     print(f"wrote {out}")
     print(f"wrote {log_dir / 'manifest.json'} and {log_dir / 'report.html'}")
     _print_run_summary(doc["tasks"], args.trials, invalid)
