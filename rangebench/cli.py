@@ -39,6 +39,7 @@ from .runner import (
     transcript_tps,
     wall_clock_scale_for,
 )
+from .submission import build_submission, public_price_lookup, validate_submission
 
 RESULTS = Path(__file__).resolve().parent.parent / "results"
 PROBE_MESSAGES = [{"role": "user", "content": "Reply with exactly: COMMAND:\necho ok"}]
@@ -486,6 +487,8 @@ def _measure_model_tps(
         )
     model_tps = tokens / llm_s
     doc["probe_task"] = probe_task_id
+    doc["probe_usage"] = probe.total_usage().as_dict()
+    doc["probe_turns_used"] = probe.turns_used
     doc["probe_attempt"] = {
         "task": probe_task_id,
         "solved": sorted(probe.solved) == sorted(s.name for s in probe_task.stages),
@@ -644,6 +647,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         "model": args.model,
         "base_url": base,
         "provider": provider,
+        "api_key_env": getattr(args, "api_key_env", None),
         "attacker_digest": attacker_digest,
         **source_fingerprint,
         "ctx_window": args.ctx_window,
@@ -651,7 +655,22 @@ def cmd_run(args: argparse.Namespace) -> None:
         "keep_tail": args.keep_tail,
         "threshold": args.threshold,
         "compact": args.compact,
+        "reasoning_effort": getattr(args, "reasoning_effort", None),
+        "display_name": getattr(args, "display_name", None) or args.model,
+        "route_name": getattr(args, "route_name", None),
+        "upstream_provider": getattr(args, "upstream_provider", None),
+        "repeat_caps": getattr(args, "repeat_caps", False),
+        "infra_retries": infra_retries,
+        "max_attempts": max_attempts,
         "selected_tasks": task_ids,
+        "task_identities": {
+            k: v for k, v in all_task_identities(TASKS_DIR).items() if k in task_ids
+        },
+        "task_catalog": [
+            {"task": task.id, "category": task.category, "tier": task.tier}
+            for task in load_all()
+            if task.id in task_ids
+        ],
         "trials": args.trials,
         "wall_clock_scale_mode": "manual" if reference is None else "reference",
         "wall_clock_scale": wall_clock_scale,
@@ -660,6 +679,9 @@ def cmd_run(args: argparse.Namespace) -> None:
     }
     if reference is not None:
         doc["wall_clock_reference"] = reference_path
+        doc["wall_clock_reference_hash"] = hashlib.sha256(
+            json.dumps(reference, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         doc["model_tps"] = None
     # Fail before spending model calls if the manifest cannot be recorded.
     _write_manifest(log_dir, doc, extra={"status": "running"})
@@ -709,6 +731,8 @@ def cmd_run(args: argparse.Namespace) -> None:
             break
         verify_source()
         task = load_task(tid)
+        if not any(item["task"] == tid for item in doc["task_catalog"]):
+            doc["task_catalog"].append({"task": tid, "category": task.category, "tier": task.tier})
         task_scale = 1.0 if wall_clock_scale is None else wall_clock_scale
         if reference is not None and model_tps is not None:
             try:
@@ -780,6 +804,9 @@ def cmd_run(args: argparse.Namespace) -> None:
                             "wall_s": res.wall_s,
                             "prompt_tokens": res.prompt_tokens,
                             "completion_tokens": res.completion_tokens,
+                            "usage": res.total_usage().as_dict(),
+                            "turns_used": res.turns_used,
+                            "terminal": not retrying,
                         }
                     )
                     save_progress()
@@ -800,6 +827,18 @@ def cmd_run(args: argparse.Namespace) -> None:
     _write_manifest(log_dir, doc, extra={"status": state})
     progress.finish(state)
     _write_report_html(log_dir, doc)
+    if state != "attempt_limit":
+        try:
+            key_names = (getattr(args, "api_key_env", None), "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+            credentials = tuple(
+                os.environ[name] for name in key_names if name and os.environ.get(name)
+            )
+            submission = build_submission(doc, sensitive_values=credentials)
+            submission_path = log_dir / "submission.json"
+            submission_path.write_text(json.dumps(submission, indent=2, allow_nan=False) + "\n")
+            print(f"wrote {submission_path}")
+        except (ValueError, KeyError, TypeError):
+            print("[warn] safe submission could not be generated; raw run was preserved")
     print(f"wrote {out}")
     print(f"wrote {log_dir / 'manifest.json'} and {log_dir / 'report.html'}")
     _print_run_summary(doc["tasks"], args.trials, invalid)
@@ -891,6 +930,82 @@ def cmd_preflight(_args: argparse.Namespace) -> None:
     print("preflight done")
 
 
+def cmd_export(args: argparse.Namespace) -> None:
+    try:
+        if args.output.resolve() == args.run_file.resolve():
+            raise ValueError("output must differ from input")
+        run = json.loads(args.run_file.read_text())
+        if not isinstance(run, dict):
+            raise ValueError("run must be an object")
+        route = args.route_name or run.get("route_name")
+        pricing = None
+        if args.lookup_pricing:
+            from .submission import _public_route
+
+            pricing = public_price_lookup(
+                args.price_model_id or run["model"],
+                route or _public_route(run.get("base_url")),
+                args.upstream_provider or run.get("upstream_provider"),
+            )
+        manual = (
+            args.input_price,
+            args.output_price,
+            args.cache_read_price,
+            args.cache_write_price,
+        )
+        if any(p is not None for p in manual):
+            if (
+                args.lookup_pricing
+                or args.input_price is None
+                or args.output_price is None
+                or not args.price_source
+                or not args.price_date
+            ):
+                raise ValueError(
+                    "manual prices require input/output rates, source and date; do not combine with lookup"
+                )
+            from .submission import _unknown_pricing
+
+            pricing = _unknown_pricing()
+            pricing.update(
+                status="estimated",
+                source=args.price_source,
+                as_of=args.price_date,
+                usd_per_million=dict(
+                    zip(("input", "output", "cache_read", "cache_write"), manual, strict=True)
+                ),
+            )
+        key_names = (run.get("api_key_env"), "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+        credentials = tuple(
+            os.environ[name] for name in key_names if isinstance(name, str) and os.environ.get(name)
+        )
+        submission = build_submission(
+            run,
+            pricing=pricing,
+            display_name=args.display_name,
+            route_name=args.route_name,
+            upstream_provider=args.upstream_provider,
+            sensitive_values=credentials,
+        )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        with args.output.open("x", encoding="utf-8") as output:
+            output.write(json.dumps(submission, indent=2, allow_nan=False) + "\n")
+        print(f"wrote {args.output}")
+    except (OSError, ValueError, KeyError, TypeError):
+        raise SystemExit(
+            "export failed: invalid input, unsafe metadata or output unavailable"
+        ) from None
+
+
+def cmd_validate_submission(args: argparse.Namespace) -> None:
+    try:
+        data = json.loads(args.submission.read_text())
+        validate_submission(data)
+    except (OSError, ValueError, KeyError, TypeError):
+        raise SystemExit("invalid submission") from None
+    print("valid self-reported submission")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="rangebench")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -902,6 +1017,9 @@ def main() -> None:
     chk.set_defaults(func=cmd_check)
     run = sub.add_parser("run", help="run agent against tasks")
     run.add_argument("--model", required=True)
+    run.add_argument("--display-name", help="public model display name")
+    run.add_argument("--route-name", help="public router or service name")
+    run.add_argument("--upstream-provider", help="public upstream model provider")
     run.add_argument(
         "--base-url",
         default=None,
@@ -987,6 +1105,28 @@ def main() -> None:
         help="openai-compatible reasoning effort knob sent to the provider (e.g. high, max)",
     )
     run.set_defaults(func=cmd_run)
+    export = sub.add_parser(
+        "export", help="export a safe standalone submission from one completed run"
+    )
+    export.add_argument("run_file", type=Path)
+    export.add_argument("--output", type=Path, required=True)
+    export.add_argument("--display-name")
+    export.add_argument("--route-name")
+    export.add_argument("--upstream-provider")
+    export.add_argument("--lookup-pricing", action="store_true")
+    export.add_argument(
+        "--price-model-id", help="exact catalog model ID when run model is an alias"
+    )
+    export.add_argument("--input-price", type=float, help="USD per million input tokens")
+    export.add_argument("--output-price", type=float, help="USD per million output tokens")
+    export.add_argument("--cache-read-price", type=float)
+    export.add_argument("--cache-write-price", type=float)
+    export.add_argument("--price-source", help="public source name for manually entered prices")
+    export.add_argument("--price-date", help="date of manually entered public prices (YYYY-MM-DD)")
+    export.set_defaults(func=cmd_export)
+    validate = sub.add_parser("validate-submission", help="validate a standalone submission")
+    validate.add_argument("submission", type=Path)
+    validate.set_defaults(func=cmd_validate_submission)
     launch = sub.add_parser("launch", help="probe profiles and start one run per model")
     launch.add_argument("configs", nargs="*", help="names in configs/ (prompted when omitted)")
     launch.add_argument("--list", action="store_true", help="list available profiles")
