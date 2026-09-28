@@ -934,7 +934,7 @@ def cmd_export(args: argparse.Namespace) -> None:
     try:
         if args.output.resolve() == args.run_file.resolve():
             raise ValueError("output must differ from input")
-        run = json.loads(args.run_file.read_text())
+        run = json.loads(args.run_file.read_text(encoding="utf-8"))
         if not isinstance(run, dict):
             raise ValueError("run must be an object")
         route = args.route_name or run.get("route_name")
@@ -999,7 +999,7 @@ def cmd_export(args: argparse.Namespace) -> None:
 
 def cmd_validate_submission(args: argparse.Namespace) -> None:
     try:
-        data = json.loads(args.submission.read_text())
+        data = json.loads(args.submission.read_text(encoding="utf-8"))
         validate_submission(data)
     except (OSError, ValueError, KeyError, TypeError):
         raise SystemExit("invalid submission") from None

@@ -122,7 +122,9 @@ def stage_import(
     }
     result = copy.deepcopy(board)
     result["models"].append(row)
-    result["models"].sort(key=lambda item: item["pass1"], reverse=True)
+    result["models"].sort(
+        key=lambda item: (item.get("pass1") is not None, item.get("pass1") or 0), reverse=True
+    )
     rates = submission["pricing"]["usd_per_million"]
     result.setdefault("pricing", {})[row_id] = {
         target: str(rates[key] / 1e6) if rates[key] is not None else None

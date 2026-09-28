@@ -106,6 +106,18 @@ class ImportSubmissionTests(unittest.TestCase):
         self.assertIsNone(result["pricing"][row["id"]]["prompt"])
         self.assertEqual(row["output_k_per_attempt"], 0.2)
 
+    def test_existing_unknown_scores_sort_last(self):
+        for missing in (False, True):
+            board, submission = fixture()
+            if missing:
+                del board["models"][0]["pass1"]
+            else:
+                board["models"][0]["pass1"] = None
+            before = copy.deepcopy(board["models"][0])
+            result = stage_import(board, submission)
+            self.assertEqual(result["models"][-1], before)
+            self.assertEqual(result["models"][0]["pass1"], 1.0)
+
     def test_duplicate_run_rejected(self):
         board, submission = fixture()
         result = stage_import(board, submission)
