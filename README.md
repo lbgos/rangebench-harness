@@ -39,6 +39,23 @@ With no names, `launch` prompts on a terminal. It validates all selected profile
 
 A direct run can use `--api-key-env MODEL_API_KEY` (otherwise the usual provider key environment variable is used), `--max-attempts`, `--infra-retries` (default 1), and `--status-json status/model.json`. The cap counts every task environment start, including infra reruns. Errors from the environment, model, or infra timeout may be rerun in a fresh environment; these attempts are unscored and recorded under `infra_attempts`. `live.log` and the status JSON show progress without flags, commands, provider errors, or raw model output. Repeated no-progress wall caps are skipped by default; `--repeat-caps` disables this skip.
 
+Completed runs also write `results/<run-id>/submission.json`, a standalone, self-reported public result. To export an older run or add public price metadata:
+
+```bash
+python3 -m rangebench export results/<run-id>.json --output submission.json --display-name "Model name" --route-name OpenRouter
+python3 -m rangebench validate-submission submission.json
+```
+
+`--lookup-pricing` fetches an unauthenticated public catalog with an exact model ID match; use `--price-model-id` if the run used an alias. Without lookup, export makes no network request and leaves pricing unknown. Manual rates use `--input-price`, `--output-price`, optional cache rates, `--price-source`, and `--price-date`; all rates are USD per million tokens. Public catalog prices produce an estimate, never a claim about the billed amount. The validator recomputes scores and usage totals and rejects unexpected fields; it does not authenticate who ran the benchmark. The export omits endpoint URLs, credentials, prompts, commands, outputs, flags and raw provider errors.
+
+To stage a validated result for a compatible leaderboard data file:
+
+```bash
+python3 scripts/import-submission.py submission.json leaderboard.json --output updated.json
+```
+
+The importer preserves existing rows and rejects duplicate runs. Different source revisions and partial coverage require `--allow-source-change` and `--allow-partial` after review. It stages JSON only; build and publish it through the site's normal workflow. Unknown costs, tokens and pass@3 remain null and must be rendered as unknown by the site. Adaptive repeat skipping is recorded in `policy.sampling`; pass@k describes the retained trials and should not be presented as a fixed-trial estimate.
+
 For slower inference, `--wall-clock-scale` multiplies caps directly, or `--wall-clock-reference PATH` reads a reference JSON, runs one unscored probe attempt, and scales caps per tier. These options are mutually exclusive. A profile's `wall_clock_reference` forwards the latter option to its run; the reference probe precedes scored task starts and counts toward the attempt cap.
 
 ## Attempts
@@ -61,7 +78,7 @@ When the transcript nears the context window, the runner compacts the middle wit
 
 Command output that is too big for the context goes to `/work/obs/NNNN.log` inside the attacker container. The model sees a bounded preview and the path, and can page through the rest itself.
 
-Each tier has a whole-attempt wall-clock default of 600 seconds for tiers 1 and 2, 1200 for tier 3 and 1800 above. It exists to catch hangs, not to rush the model. A task can set its own `wall_clock` in `task.json`. Tasks have no turn cap unless `task.json` sets `turns` for debugging. The runner records steps and tokens without limiting them.
+Each tier has a whole-attempt wall-clock default of 600 seconds for tier 1, 900 for tier 2, 1500 for tier 3 and 1800 above. It exists to catch hangs, not to rush the model. A task can set its own `wall_clock` in `task.json`. Tasks have no turn cap unless `task.json` sets `turns` for debugging. The runner records steps and tokens without limiting them.
 
 ## Example task
 
