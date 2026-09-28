@@ -50,6 +50,7 @@ FAIL_ENV = "env_error"
 FAIL_PROTOCOL = "protocol_error"
 FAIL_BUDGET = "budget_exhausted"
 FAIL_NORMAL = "normal"
+FAIL_SKIPPED = "skipped"
 FAIL_CLASSES = (FAIL_SOLVED, FAIL_PROVIDER, FAIL_ENV, FAIL_PROTOCOL, FAIL_BUDGET, FAIL_NORMAL)
 
 # Exact end-reason sentinels emitted by run_attempt and cmd_run. Match on
@@ -1082,12 +1083,14 @@ class _AttemptLoop:
         """Check each submitted flag against the pending stages and reply with the verdict."""
         res = self.res
         for flag in answers:
-            self.emit("submit", flag=flag[:200])
+            self.emit("submit")
+
             hit = next(
                 (st for st in self.pending if flag.strip() == self.truth[st.name].strip()), None
             )
             if hit:
                 res.solved.append(hit.name)
+                self.emit("stage-completed", stage=hit.name)
                 self.pending.remove(hit)
                 self._exchange(
                     content, _scored_feedback(hit.name, flag, [s.name for s in self.pending])
@@ -1097,6 +1100,7 @@ class _AttemptLoop:
                     break
             else:
                 res.wrong += 1
+                self.emit("incorrect-submission", wrong=res.wrong)
                 if res.wrong >= WRONG_LIMIT:
                     res.end_reason = "too many wrong submissions"
                     break
@@ -1245,6 +1249,8 @@ def run_attempt(
     attacker_image: str = ATTACKER_IMAGE,
     wall_clock_scale: float = 1.0,
     model_tps: float | None = None,
+    on_event: Callable[[str, dict[str, Any]], None] | None = None,
+    log_suffix: str = "",
 ) -> AttemptResult:
     """Run one agent attempt against a live task env.
 
@@ -1261,7 +1267,7 @@ def run_attempt(
     # in the summary.
     wall_clock = _resolve_wall_clock(task, wall_clock_scale)
     res.wall_clock_seconds = wall_clock
-    log_path = log_dir / f"{task.id}-t{trial}.jsonl"
+    log_path = log_dir / f"{task.id}-t{trial}{log_suffix}.jsonl"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log = log_path.open("w", encoding="utf-8")
 
@@ -1271,6 +1277,24 @@ def run_attempt(
         # malformed command can receive an ordinary observation below.
         log.write(json.dumps(rec, ensure_ascii=True) + "\n")
         log.flush()
+        if on_event is not None and kind in {
+            "submit",
+            "stage-completed",
+            "incorrect-submission",
+            "compaction",
+            "compaction-fallback",
+            "context-retry",
+            "generation-retry",
+            "compaction-retry",
+        }:
+            on_event(
+                kind,
+                {
+                    k: v
+                    for k, v in kv.items()
+                    if k in {"stage", "wrong", "mode", "ctx_window", "max_tokens"}
+                },
+            )
 
     emit(
         "budget-config",

@@ -43,6 +43,30 @@ class NoCallsClient:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_progress_events_exclude_sensitive_transcript_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch("rangebench.runner.TaskEnv", FakeEnv):
+            task = Task(
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+            )
+            forwarded: list[tuple[str, dict]] = []
+            run_attempt(
+                AnswerClient(),
+                task,
+                1,
+                "rb-test",
+                Path(tmp),
+                verbose=False,
+                on_event=lambda kind, data: forwarded.append((kind, data)),
+                log_suffix="-infra1",
+            )
+            self.assertTrue((Path(tmp) / "sample-t1-infra1.jsonl").is_file())
+        self.assertEqual(forwarded, [("submit", {}), ("stage-completed", {"stage": "one"})])
+
     def test_llm_event_records_response_shape_without_response_text(self) -> None:
         class MetadataClient:
             def chat(self, *_args: object, **_kwargs: object) -> None:
@@ -87,6 +111,11 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("content", call)
 
     def test_release_tasks_allow_more_than_previous_turn_cap(self) -> None:
+        from rangebench.env import TASKS_DIR
+
+        if not TASKS_DIR.is_dir():
+            self.skipTest("release tasks are not present in this checkout")
+
         class SlowClient:
             def __init__(self) -> None:
                 self.calls = 0
@@ -374,9 +403,9 @@ class RunnerTests(unittest.TestCase):
             with (
                 patch("rangebench.runner.TaskEnv", FakeEnv),
                 patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stderr="")),
+                self.assertRaisesRegex(EnvError, "oracle failed"),
             ):
-                with self.assertRaisesRegex(EnvError, "oracle failed"):
-                    run_oracle(task)
+                run_oracle(task)
 
     def test_oracle_dependency_copy_failure_is_fatal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -399,9 +428,9 @@ class RunnerTests(unittest.TestCase):
             with (
                 patch("rangebench.runner.TaskEnv", FakeEnv),
                 patch("subprocess.run", side_effect=copies),
+                self.assertRaisesRegex(EnvError, "docker cp helper.sh"),
             ):
-                with self.assertRaisesRegex(EnvError, "docker cp helper.sh"):
-                    run_oracle(task)
+                run_oracle(task)
 
 
 if __name__ == "__main__":

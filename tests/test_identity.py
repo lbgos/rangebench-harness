@@ -117,6 +117,8 @@ class IdentityTests(unittest.TestCase):
 
 class GateTests(unittest.TestCase):
     def test_gate_passes_on_real_tasks(self) -> None:
+        if not TASKS_DIR.is_dir():
+            self.skipTest("release tasks are not present in this checkout")
         real = [p for p in TASKS_DIR.iterdir() if (p / "task.json").exists()]
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(check_gates.main(), 0)
@@ -265,6 +267,8 @@ class IdentitiesCommandTests(unittest.TestCase):
             self.assertRegex(ident, HEX16)
 
     def test_cli_identities_lists_all_real_tasks(self) -> None:
+        if not TASKS_DIR.is_dir():
+            self.skipTest("release tasks are not present in this checkout")
         with contextlib.redirect_stdout(io.StringIO()) as out:
             cmd_identities(argparse.Namespace())
         rows = [line.split() for line in out.getvalue().splitlines()[1:]]

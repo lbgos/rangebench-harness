@@ -25,6 +25,22 @@ python3 -m rangebench run --model <model> --base-url <url> --trials 3 jwt-none
 
 A run needs an OpenAI-compatible `/v1/chat/completions` endpoint. `--base-url` falls back to `$OPENAI_BASE_URL`, then `http://localhost:8000/v1`. `--provider anthropic` switches to the Anthropic `/v1/messages` client. Each run writes a JSONL transcript per attempt, `manifest.json` and `report.html` under `results/`.
 
+## Launching competitors
+
+Put one profile per model in `configs/<name>.toml`; see `configs/local-example.toml`. Required fields are `display_name`, `base_url`, `api_key_env`, `model`, `ctx_window`, and `trials`. Optional fields include `provider`, `reasoning_effort` (OpenAI only), `wall_clock_reference`, and `notes`. `api_key_env` names an environment variable; never put a key in a profile or command line.
+
+```bash
+python3 -m rangebench launch --list
+python3 -m rangebench launch local-example --dry-run
+python3 -m rangebench launch model-a model-b --parallel 2 --status-dir status
+```
+
+With no names, `launch` prompts on a terminal. It validates all selected profiles, requires their key variables, and probes every endpoint before starting any run. `--dry-run` still probes and may incur API costs. Each profile runs in its own process. `--max-attempts K` and `--infra-retries N` are forwarded to each run; `--status-dir` writes one live JSON file per profile.
+
+A direct run can use `--api-key-env MODEL_API_KEY` (otherwise the usual provider key environment variable is used), `--max-attempts`, `--infra-retries` (default 1), and `--status-json status/model.json`. The cap counts every task environment start, including infra reruns. Errors from the environment, model, or infra timeout may be rerun in a fresh environment; these attempts are unscored and recorded under `infra_attempts`. `live.log` and the status JSON show progress without flags, commands, provider errors, or raw model output. Repeated no-progress wall caps are skipped by default; `--repeat-caps` disables this skip.
+
+For slower inference, `--wall-clock-scale` multiplies caps directly, or `--wall-clock-reference PATH` reads a reference JSON, runs one unscored probe attempt, and scales caps per tier. These options are mutually exclusive. A profile's `wall_clock_reference` forwards the latter option to its run; the reference probe precedes scored task starts and counts toward the attempt cap.
+
 ## Attempts
 
 Every attempt gets a fresh Compose project and a fresh attacker container. Before anything starts, the env checks the Compose config and refuses any network that is external or not marked internal. After start it inspects every project network through Docker and aborts if one allows outside access.

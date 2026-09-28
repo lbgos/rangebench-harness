@@ -21,12 +21,15 @@ from pathlib import Path
 from .agent import AnthropicChatClient, ChatClient, ChatClientProtocol, Usage
 from .env import TASKS_DIR, EnvError, Task, load_all, load_task
 from .identity import all_task_identities
+from .launch import cmd_launch
+from .progress import Progress
 from .runner import (
     DEFAULT_CTX_WINDOW,
     DEFAULT_KEEP_TAIL,
     DEFAULT_RESERVE,
     DEFAULT_THRESHOLD,
     FAIL_CLASSES,
+    FAIL_SKIPPED,
     MAX_CTX_WINDOW,
     MAX_WALL_CLOCK_SCALE,
     AttemptResult,
@@ -213,6 +216,7 @@ def _write_manifest(log_dir: Path, doc: dict, extra: dict | None = None) -> None
         "service_image_ids": [
             {"task": task["task"], "trial": task["trial"], "images": task["service_image_ids"]}
             for task in doc.get("tasks", [])
+            if task.get("fail_class") != FAIL_SKIPPED
         ],
         "service_image_fingerprints": [
             {
@@ -221,9 +225,10 @@ def _write_manifest(log_dir: Path, doc: dict, extra: dict | None = None) -> None
                 "images": task["service_image_fingerprints"],
             }
             for task in doc.get("tasks", [])
+            if task.get("fail_class") != FAIL_SKIPPED
         ],
         "task_set_hash": doc.get("task_set_hash"),
-        "task_count": len(doc.get("tasks", [])),
+        "task_count": sum(t.get("fail_class") != FAIL_SKIPPED for t in doc.get("tasks", [])),
         "output_tokens_include_reasoning": True,
         "usage_coverage": {
             key: sum(int(task.get(key) or 0) for task in doc.get("tasks", []))
@@ -249,12 +254,20 @@ def _write_report_html(log_dir: Path, doc: dict) -> None:
         rows = []
         for t in tasks:
             out_tok = t.get("completion_tokens", 0)
-            status = "error" if not t.get("scored", True) else "pass" if t.get("solved") else "fail"
+            status = (
+                "skipped"
+                if t.get("fail_class") == FAIL_SKIPPED
+                else "error"
+                if not t.get("scored", True)
+                else "pass"
+                if t.get("solved")
+                else "fail"
+            )
             color = "#10b981" if status == "pass" else "#ef4444" if status == "error" else "#9ca3af"
             rows.append(
                 f"<tr><td>{html.escape(t.get('task', ''))}</td><td>{html.escape(t.get('category', ''))}</td><td>T{t.get('tier', '')}</td><td style='color:{color}'>{status}</td><td>{t.get('turns_used', 0)}/{t.get('turns_budget') if t.get('turns_budget') is not None else '∞'}</td><td>{out_tok}</td><td>{t.get('wall_s', 0)}</td><td>{html.escape(t.get('end_reason', ''))}</td></tr>"
             )
-        scored = [t for t in tasks if t.get("scored", True)]
+        scored = [t for t in tasks if t.get("scored", True) and t.get("fail_class") != FAIL_SKIPPED]
         solved = sum(1 for t in scored if t.get("solved"))
         total = len(scored)
         body = f"<h1>rangebench {html.escape(doc.get('id', ''))}</h1><p>model {html.escape(doc.get('model', ''))} - {solved}/{total} - {html.escape(doc.get('started', ''))}</p><table border=1 cellpadding=6><tr><th>task</th><th>cat</th><th>tier</th><th>result</th><th>turns</th><th>out tok</th><th>wall</th><th>end</th></tr>{''.join(rows)}</table>"
@@ -296,16 +309,21 @@ def _base_url(args: argparse.Namespace) -> str:
 
 def _make_client(args: argparse.Namespace, base: str) -> ChatClientProtocol:
     """The chat client for --provider, --model and (openai only) --reasoning-effort."""
+    key_env = getattr(args, "api_key_env", None)
+    if key_env and not os.environ.get(key_env):
+        raise SystemExit(f"{key_env} is unset")
+    key = os.environ.get(key_env) if key_env else None
     if getattr(args, "provider", "openai") == "anthropic":
         return AnthropicChatClient(
             base_url=base,
-            api_key=os.environ.get("ANTHROPIC_API_KEY")
+            api_key=key
+            or os.environ.get("ANTHROPIC_API_KEY")
             or os.environ.get("OPENAI_API_KEY", "dummy"),
             model=args.model,
         )
     return ChatClient(
         base_url=base,
-        api_key=os.environ.get("OPENAI_API_KEY", "dummy"),
+        api_key=key or os.environ.get("OPENAI_API_KEY", "dummy"),
         model=args.model,
         reasoning_effort=getattr(args, "reasoning_effort", None),
     )
@@ -315,6 +333,10 @@ def _validate_run_args(args: argparse.Namespace) -> tuple[float | None, dict | N
     """Check run flags; return (manual wall-clock scale, loaded reference). SystemExit on error."""
     if args.trials < 1:
         raise SystemExit("--trials must be at least 1")
+    if getattr(args, "max_attempts", None) is not None and args.max_attempts < 1:
+        raise SystemExit("--max-attempts must be at least 1")
+    if getattr(args, "infra_retries", 1) < 0:
+        raise SystemExit("--infra-retries must be nonnegative")
     if (
         not 0 < args.ctx_window <= MAX_CTX_WINDOW
         or args.ctx_window <= args.reserve
@@ -376,6 +398,8 @@ def _attempt(
     attacker_digest: str,
     wall_clock_scale: float,
     model_tps: float | None,
+    on_event: Callable[[str, dict], None] | None = None,
+    log_suffix: str = "",
 ) -> AttemptResult:
     """run_attempt with the run's compaction and --keep settings."""
     return run_attempt(
@@ -393,6 +417,8 @@ def _attempt(
         attacker_image=attacker_digest,
         wall_clock_scale=wall_clock_scale,
         model_tps=model_tps,
+        on_event=on_event,
+        log_suffix=log_suffix,
     )
 
 
@@ -403,6 +429,7 @@ def _measure_model_tps(
     log_dir: Path,
     attacker_digest: str,
     verify_source: Callable[[], None],
+    progress: Progress | None = None,
 ) -> float:
     """Run one unscored probe attempt and return the model's tokens/sec.
 
@@ -418,6 +445,8 @@ def _measure_model_tps(
         raise SystemExit(f"--wall-clock-probe-task {probe_task_id}: {exc}") from None
     verify_source()
     probe_dir = log_dir / "probe"
+    if progress is not None:
+        progress.start_probe()
     try:
         probe = _attempt(
             args,
@@ -436,6 +465,9 @@ def _measure_model_tps(
             f"wall-clock reference probe attempt failed ({exc or type(exc).__name__}); "
             "run not started"
         ) from None
+    finally:
+        if progress is not None:
+            progress.end_probe()
     try:
         tokens, llm_s, calls = transcript_tps(probe_dir / f"{probe_task.id}-t1.jsonl")
     except OSError:
@@ -522,14 +554,30 @@ def _attempt_record(task: Task, trial: int, res: AttemptResult, task_scale: floa
     }
 
 
+def _skipped_record(task: Task, trial: int, task_scale: float) -> dict:
+    """A placeholder with no score, environment, usage, or wall time."""
+    record = _attempt_record(task, trial, AttemptResult(task.id, trial), task_scale)
+    record.update(
+        scored=False,
+        fail_class=FAIL_SKIPPED,
+        end_reason="skipped: repeat after no-progress wall cap",
+        wall_clock_scale=task_scale,
+    )
+    for key, value in record.items():
+        if key != "max_output_tokens" and "tokens" in key and value is None:
+            record[key] = 0
+    return record
+
+
 def _print_run_summary(tasks: list[dict], trials: int, invalid: int) -> None:
     """Print solve counts, per-category/tier splits, failure classes, and per-task rows."""
+    attempted = [t for t in tasks if t["fail_class"] != FAIL_SKIPPED]
     scored = [t for t in tasks if t["scored"]]
     solved_count = sum(1 for t in scored if t["solved"])
     total = len(scored)
     print(f"tasks solved: {solved_count}/{total} scored runs ({invalid} invalid)")
     by_cat = defaultdict(list)
-    for t in tasks:
+    for t in attempted:
         by_cat[t["category"]].append(t)
     print("\nper-category:")
     for cat, lst in sorted(by_cat.items()):
@@ -537,7 +585,7 @@ def _print_run_summary(tasks: list[dict], trials: int, invalid: int) -> None:
         s = sum(1 for x in valid if x["solved"])
         print(f"  {cat:10} {s}/{len(valid)} ({len(lst) - len(valid)} invalid)")
     by_tier = defaultdict(list)
-    for t in tasks:
+    for t in attempted:
         by_tier[t["tier"]].append(t)
     print("per-tier:")
     for tier in sorted(by_tier):
@@ -546,16 +594,20 @@ def _print_run_summary(tasks: list[dict], trials: int, invalid: int) -> None:
         s = sum(1 for x in valid if x["solved"])
         print(f"  T{tier} {s}/{len(valid)} ({len(lst) - len(valid)} invalid)")
     fail_counts = {name: sum(1 for t in tasks if t["fail_class"] == name) for name in FAIL_CLASSES}
-    print("failure classes: " + " ".join(f"{name}={fail_counts[name]}" for name in FAIL_CLASSES))
-    refusal_turns = sum(int(t["refusals"]) for t in tasks)
-    refusing = sum(1 for t in tasks if t["refusals"])
-    print(f"refusals: {refusal_turns} turns in {refusing}/{len(tasks)} attempts")
+    print(
+        "failure classes: "
+        + " ".join(f"{name}={fail_counts[name]}" for name in FAIL_CLASSES)
+        + f" {FAIL_SKIPPED}={len(tasks) - len(attempted)}"
+    )
+    refusal_turns = sum(int(t["refusals"]) for t in attempted)
+    refusing = sum(1 for t in attempted if t["refusals"])
+    print(f"refusals: {refusal_turns} turns in {refusing}/{len(attempted)} attempts")
     if trials > 1:
         p = solved_count / total if total else 0
         lo, hi = _wilson(p, total)
         print(f"overall Wilson 95%: {p:.2%} [{lo:.2%}, {hi:.2%}] n={total}")
         _print_pass_at_k(tasks, trials)
-    toks = [t["completion_tokens"] for t in tasks]
+    toks = [t["completion_tokens"] for t in attempted]
     if toks:
         print(
             f"output tokens: mean {statistics.mean(toks):.0f} median {statistics.median(toks):.0f} max {max(toks)}"
@@ -571,6 +623,8 @@ def _print_run_summary(tasks: list[dict], trials: int, invalid: int) -> None:
 
 def cmd_run(args: argparse.Namespace) -> None:
     wall_clock_scale, reference = _validate_run_args(args)
+    max_attempts = getattr(args, "max_attempts", None)
+    infra_retries = getattr(args, "infra_retries", 1)
     reference_path = getattr(args, "wall_clock_reference", None)
     task_ids = args.tasks if args.tasks else [t.id for t in load_all()]
     base = _base_url(args)
@@ -609,17 +663,50 @@ def cmd_run(args: argparse.Namespace) -> None:
         doc["model_tps"] = None
     # Fail before spending model calls if the manifest cannot be recorded.
     _write_manifest(log_dir, doc, extra={"status": "running"})
+    status_path = getattr(args, "status_json", None)
+    progress = Progress(
+        log_dir,
+        Path(status_path) if status_path else None,
+        task_ids,
+        args.trials,
+        max_attempts,
+        infra_retries,
+        probe_attempts=int(reference is not None),
+    )
+    doc["infra_attempts"] = []
 
     def verify_source(completed_attempt: bool = False) -> None:
-        _verify_source(doc, source_fingerprint, out, log_dir, completed_attempt)
+        try:
+            _verify_source(doc, source_fingerprint, out, log_dir, completed_attempt)
+        except SystemExit:
+            progress.finish("source_changed")
+            raise
+
+    def save_progress() -> None:
+        _write_run_doc(out, doc)
+        _write_manifest(
+            log_dir,
+            doc,
+            extra={"status": "running", "progress": f"{progress.used}/{progress.limit}"},
+        )
 
     model_tps: float | None = None
     if reference is not None:
         # One unscored agent attempt measures generation speed; fail before the run starts.
-        model_tps = _measure_model_tps(args, client, doc, log_dir, attacker_digest, verify_source)
+        try:
+            model_tps = _measure_model_tps(
+                args, client, doc, log_dir, attacker_digest, verify_source, progress
+            )
+        except SystemExit:
+            progress.finish("probe_failed")
+            raise
         _write_manifest(log_dir, doc, extra={"status": "running"})
 
+    capped = False
     for tid in task_ids:
+        if progress.used >= progress.limit:
+            capped = True
+            break
         verify_source()
         task = load_task(tid)
         task_scale = 1.0 if wall_clock_scale is None else wall_clock_scale
@@ -630,28 +717,88 @@ def cmd_run(args: argparse.Namespace) -> None:
                 raise SystemExit(f"--wall-clock-reference {reference_path}: {exc}") from None
         for trial in range(1, args.trials + 1):
             verify_source()
-            project = f"rb-{task.id}-{trial}-{uuid.uuid4().hex[:6]}"
-            res = _attempt(
-                args, client, task, trial, project, log_dir, attacker_digest, task_scale, model_tps
-            )
+            prior = [
+                t for t in doc["tasks"] if t["task"] == tid and t["fail_class"] != FAIL_SKIPPED
+            ]
+            if (
+                trial > 1
+                and not getattr(args, "repeat_caps", False)
+                and prior
+                and all(
+                    not t["solved"] and t["wall_clock_exceeded"] and not t["solved_stages"]
+                    for t in prior
+                )
+            ):
+                doc["tasks"].append(_skipped_record(task, trial, task_scale))
+                progress.skip(tid, trial, "repeat after no-progress wall cap")
+                save_progress()
+                continue
+            if progress.used >= progress.limit:
+                capped = True
+                break
+            retry = 0
+            while True:
+                project = f"rb-{task.id}-{trial}-{uuid.uuid4().hex[:6]}"
+                progress.start(tid, trial, retry)
+
+                def on_event(
+                    kind: str, data: dict, task_id: str = tid, task_trial: int = trial
+                ) -> None:
+                    progress.event(task_id, task_trial, kind, data)
+
+                res = _attempt(
+                    args,
+                    client,
+                    task,
+                    trial,
+                    project,
+                    log_dir,
+                    attacker_digest,
+                    task_scale,
+                    model_tps,
+                    on_event=on_event,
+                    log_suffix=f"-infra{retry}" if retry else "",
+                )
+                infra_failure = res.end_reason.startswith("env:") or res.end_reason in {
+                    "llm error",
+                    "infra timeout",
+                }
+                retrying = (
+                    infra_failure and retry < infra_retries and progress.used < progress.limit
+                )
+                scored = not (infra_failure or res.end_reason == "context window exhausted")
+                solved = sorted(res.solved) == sorted(s.name for s in task.stages)
+                progress.end(tid, trial, res, scored, solved, retrying)
+                if infra_failure:
+                    doc["infra_attempts"].append(
+                        {
+                            "task": tid,
+                            "trial": trial,
+                            "retry": retry,
+                            "fail_class": classify_end_reason(res.end_reason, False),
+                            "scored": False,
+                            "wall_s": res.wall_s,
+                            "prompt_tokens": res.prompt_tokens,
+                            "completion_tokens": res.completion_tokens,
+                        }
+                    )
+                    save_progress()
+                if not retrying:
+                    break
+                verify_source()
+                retry += 1
             doc["tasks"].append(_attempt_record(task, trial, res, task_scale))
             verify_source(completed_attempt=True)
-            _write_run_doc(out, doc)
-            _write_manifest(
-                log_dir,
-                doc,
-                extra={
-                    "status": "running",
-                    "progress": f"{len(doc['tasks'])}/{len(task_ids) * args.trials}",
-                },
-            )
+            save_progress()
+    if max_attempts is not None and progress.used >= progress.limit:
+        capped = capped or any(slot["state"] == "pending" for slot in progress.tasks.values())
     verify_source()
     doc["finished"] = datetime.now(UTC).isoformat()
     _write_run_doc(out, doc)
-    invalid = sum(1 for t in doc["tasks"] if not t["scored"])
-    _write_manifest(
-        log_dir, doc, extra={"status": "completed_with_errors" if invalid else "completed"}
-    )
+    invalid = sum(1 for t in doc["tasks"] if not t["scored"] and t["fail_class"] != FAIL_SKIPPED)
+    state = "attempt_limit" if capped else "completed_with_errors" if invalid else "completed"
+    _write_manifest(log_dir, doc, extra={"status": state})
+    progress.finish(state)
     _write_report_html(log_dir, doc)
     print(f"wrote {out}")
     print(f"wrote {log_dir / 'manifest.json'} and {log_dir / 'report.html'}")
@@ -766,6 +913,24 @@ def main() -> None:
     run.add_argument("tasks", nargs="*")
     run.add_argument("--trials", type=int, default=1)
     run.add_argument(
+        "--max-attempts",
+        type=int,
+        help="hard cap on all environment starts, including infra retries",
+    )
+    run.add_argument(
+        "--infra-retries",
+        type=int,
+        default=1,
+        help="fresh reruns after env/LLM errors per task/trial",
+    )
+    run.add_argument(
+        "--status-json", type=Path, help="atomically updated machine-readable status file"
+    )
+    run.add_argument("--api-key-env", help="name of API key environment variable")
+    run.add_argument(
+        "--repeat-caps", action="store_true", help="run all trials after no-progress wall caps"
+    )
+    run.add_argument(
         "--wall-clock-scale",
         type=float,
         default=None,
@@ -822,6 +987,17 @@ def main() -> None:
         help="openai-compatible reasoning effort knob sent to the provider (e.g. high, max)",
     )
     run.set_defaults(func=cmd_run)
+    launch = sub.add_parser("launch", help="probe profiles and start one run per model")
+    launch.add_argument("configs", nargs="*", help="names in configs/ (prompted when omitted)")
+    launch.add_argument("--list", action="store_true", help="list available profiles")
+    launch.add_argument("--parallel", type=int, help="number of concurrent run units (default 1)")
+    launch.add_argument(
+        "--dry-run", action="store_true", help="probe then print commands without spawning"
+    )
+    launch.add_argument("--max-attempts", type=int)
+    launch.add_argument("--infra-retries", type=int)
+    launch.add_argument("--status-dir", type=Path, help="write one status JSON per config name")
+    launch.set_defaults(func=cmd_launch)
     probe = sub.add_parser("probe")
     probe.add_argument("--model", required=True)
     probe.add_argument("--base-url", default=None)
