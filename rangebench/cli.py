@@ -477,6 +477,9 @@ def _measure_model_tps(
         "infra timeout",
         "llm error",
         "context window exhausted",
+        "model refusal",
+        "empty provider response",
+        "model produced no content 11x",
     }
     if execution_failed or tokens < 500 or llm_s < 1.0 or calls < 3:
         _write_manifest(log_dir, doc, extra={"status": "probe_failed"})
@@ -517,7 +520,14 @@ def _attempt_record(task: Task, trial: int, res: AttemptResult, task_scale: floa
         "solved": solved,
         "scored": not (
             res.end_reason.startswith("env:")
-            or res.end_reason in {"infra timeout", "llm error", "context window exhausted"}
+            or res.end_reason
+            in {
+                "infra timeout",
+                "llm error",
+                "context window exhausted",
+                "model refusal",
+                "empty provider response",
+            }
         ),
         "fail_class": classify_end_reason(res.end_reason, solved),
         "wrong": res.wrong,
@@ -744,6 +754,16 @@ def cmd_run(args: argparse.Namespace) -> None:
             prior = [
                 t for t in doc["tasks"] if t["task"] == tid and t["fail_class"] != FAIL_SKIPPED
             ]
+            if any(
+                t.get("refusals", 0) or t.get("end_reason") == "empty provider response"
+                for t in prior
+            ):
+                skipped = _skipped_record(task, trial, task_scale)
+                skipped["end_reason"] = "skipped: prior refusal or empty provider response"
+                doc["tasks"].append(skipped)
+                progress.skip(tid, trial, "prior refusal or empty provider response")
+                save_progress()
+                continue
             if (
                 trial > 1
                 and not getattr(args, "repeat_caps", False)
@@ -790,7 +810,11 @@ def cmd_run(args: argparse.Namespace) -> None:
                 retrying = (
                     infra_failure and retry < infra_retries and progress.used < progress.limit
                 )
-                scored = not (infra_failure or res.end_reason == "context window exhausted")
+                scored = not (
+                    infra_failure
+                    or res.end_reason
+                    in {"context window exhausted", "model refusal", "empty provider response"}
+                )
                 solved = sorted(res.solved) == sorted(s.name for s in task.stages)
                 progress.end(tid, trial, res, scored, solved, retrying)
                 if infra_failure:

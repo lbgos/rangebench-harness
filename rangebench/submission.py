@@ -30,6 +30,7 @@ USAGE = (
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+@ -]{0,159}\Z")
 SAFE_HASH = re.compile(r"[a-fA-F0-9]{16,64}\Z")
 FAILS = {
+    "refusal",
     "solved",
     "provider_error",
     "env_error",
@@ -93,7 +94,11 @@ def _attempt(raw: dict[str, Any], kind: str) -> dict[str, Any]:
     )
     scored = raw.get("scored", False) if type(raw.get("scored", False)) is bool else False
     solved = raw.get("solved", False) if type(raw.get("solved", False)) is bool else False
-    if kind == "task" and fail_class in {"provider_error", "env_error", "skipped"} and scored:
+    if (
+        kind == "task"
+        and fail_class in {"provider_error", "env_error", "skipped", "refusal"}
+        and scored
+    ):
         raise ValueError("unscored failure marked scored")
     if kind == "task" and solved != (fail_class == "solved"):
         raise ValueError("solved outcome conflicts with failure class")

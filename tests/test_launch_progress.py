@@ -175,6 +175,38 @@ class LaunchProgressTests(unittest.TestCase):
             self.assertIn("prompt/completion 0/0 tok", live)
             self.assertIn("attempts 1/2", stdout.getvalue())
 
+    def test_refusal_is_unscored_and_skips_repeat_without_retry(self):
+        task = Task("sample", Path("/tmp"), "web", 1, "Example", stages=[Stage("one", "/flag", "web")])
+        args = argparse.Namespace(
+            trials=2, tasks=[task.id], model="fake", base_url="http://localhost:8000/v1",
+            provider="openai", ctx_window=128000, reserve=12000, keep_tail=12,
+            threshold=0.82, compact="deterministic", keep=False, infra_retries=3,
+            repeat_caps=True,
+        )
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(tmp)
+            args.status_json = root / "status.json"
+            with (
+                patch("rangebench.cli.RESULTS", root),
+                patch("rangebench.cli.load_task", return_value=task),
+                patch("rangebench.cli.load_all", return_value=[task]),
+                patch("rangebench.cli.ChatClient"),
+                patch("rangebench.cli._get_attacker_digest", return_value="sha256:" + "a" * 64),
+                patch("rangebench.cli.run_attempt", return_value=AttemptResult(
+                    task.id, 1, end_reason="model refusal", refusals=1,
+                )) as attempt,
+            ):
+                with self.assertRaises(SystemExit):
+                    cmd_run(args)
+            self.assertEqual(attempt.call_count, 1)
+            run = json.loads((root / "latest.json").read_text())
+            self.assertEqual([t["fail_class"] for t in run["tasks"]], ["refusal", "skipped"])
+            self.assertTrue(all(not t["scored"] for t in run["tasks"]))
+            self.assertEqual(run["infra_attempts"], [])
+            submission = json.loads(next(root.glob("*/submission.json")).read_text())
+            self.assertEqual(submission["summary"]["scored"], 0)
+            self.assertIsNone(submission["summary"]["pass_at_1"])
+
     def test_cap_stops_before_next_scored_trial(self):
         task = Task(
             "sample", Path("/tmp"), "web", 1, "Find the flag", stages=[Stage("one", "/flag", "web")]
