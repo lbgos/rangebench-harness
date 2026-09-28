@@ -159,6 +159,8 @@ class Progress:
         self.line(f"{tid} t{trial} · skipped: {reason}")
 
     def finish(self, state: str) -> None:
+        if self.finished is not None:
+            return
         self.state = state
         self.finished = datetime.now(UTC).isoformat()
         self.line(f"run {state} · attempts {self.used}/{self.limit} · {self.tokens} tok")

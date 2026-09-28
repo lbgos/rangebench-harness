@@ -216,6 +216,87 @@ class LaunchProgressTests(unittest.TestCase):
             self.assertEqual(status["state"], "attempt_limit")
             self.assertEqual(len(json.loads((root / "latest.json").read_text())["tasks"]), 1)
 
+    def test_config_rejects_remote_http_but_allows_loopback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model.toml"
+            base = (
+                'display_name="Model"\napi_key_env="MODEL_KEY"\nmodel="one"\n'
+                "ctx_window=8000\ntrials=2\n"
+            )
+            for url in (
+                "https://example.test/v1",
+                "http://localhost:8000/v1",
+                "http://127.0.0.1:8000/v1",
+                "http://[::1]:8000/v1",
+            ):
+                path.write_text(base + f'base_url="{url}"\n')
+                self.assertEqual(load_config(path).base_url, url)
+            path.write_text(base + 'base_url="http://example.test/v1"\n')
+            with self.assertRaisesRegex(ValueError, "https"):
+                load_config(path)
+
+    def test_finish_is_idempotent_and_keeps_first_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            progress = Progress(root, root / "status.json", ["sample"], 1, None)
+            progress.finish("completed")
+            progress.finish("probe_failed")
+            self.assertEqual(progress.state, "completed")
+            self.assertEqual(json.loads((root / "status.json").read_text())["state"], "completed")
+
+    def test_launch_waits_for_any_free_slot(self):
+        class FakeProc:
+            def __init__(self, events: list[str], tag: str, polls_before_done: int):
+                self.events = events
+                self.tag = tag
+                self.polls = polls_before_done
+
+            def poll(self) -> int | None:
+                if self.polls > 0:
+                    self.polls -= 1
+                    return None
+                return 0
+
+            def wait(self) -> int:
+                self.events.append(f"wait-{self.tag}")
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("one", "two", "three"):
+                (Path(tmp) / f"{name}.toml").write_text(
+                    'display_name="Fake"\nbase_url="https://example.test/v1"\n'
+                    'api_key_env="FAKE_KEY"\nmodel="one"\nctx_window=8000\ntrials=1\n'
+                )
+            args = argparse.Namespace(
+                configs=["one", "two", "three"],
+                list=False,
+                parallel=2,
+                max_attempts=None,
+                infra_retries=None,
+                status_dir=None,
+                dry_run=False,
+            )
+            events: list[str] = []
+            procs = [FakeProc(events, str(i), polls) for i, polls in enumerate((1, 0, 0))]
+
+            def fake_popen(cmd: list[str]) -> FakeProc:
+                proc = procs[len([e for e in events if e.startswith("start-")])]
+                events.append(f"start-{proc.tag}")
+                return proc
+
+            with (
+                patch("rangebench.launch.CONFIGS", Path(tmp)),
+                patch.dict("os.environ", {"FAKE_KEY": "placeholder"}),
+                patch("rangebench.launch._probe"),
+                patch("rangebench.launch.subprocess.Popen", side_effect=fake_popen),
+                patch("rangebench.launch.time.sleep"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                cmd_launch(args)
+        # The fast second run frees its slot while the first is still going,
+        # so the third command starts before the first process is reaped.
+        self.assertEqual(events, ["start-0", "start-1", "wait-1", "start-2", "wait-0", "wait-2"])
+
 
 if __name__ == "__main__":
     unittest.main()

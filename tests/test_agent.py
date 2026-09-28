@@ -1,9 +1,16 @@
 import json
 import unittest
+import urllib.error
 import urllib.request
 from unittest.mock import patch
 
-from rangebench.agent import AnthropicChatClient, ChatClient, ChatResult, ResponseMetadata
+from rangebench.agent import (
+    AnthropicChatClient,
+    ChatClient,
+    ChatResult,
+    ResponseMetadata,
+    _CredentialSafeRedirectHandler,
+)
 
 
 class FakeResponse:
@@ -122,6 +129,22 @@ class ResponseMetadataTests(unittest.TestCase):
             result = client.chat_result(self.messages, max_tokens=8)
         self.assertEqual(result.error, "missing input or output token usage")
         self.assertEqual(result.metadata, ResponseMetadata(None, None, None, 8))
+
+    def test_redirect_handler_blocks_key_leak_vectors(self) -> None:
+        handler = _CredentialSafeRedirectHandler()
+        origin = urllib.request.Request("https://api.example.test/v1", method="POST")
+        for target in (
+            "https://evil.test/v1",
+            "http://api.example.test/v1",
+            "https://api.example.test:8443/v1",
+        ):
+            with self.subTest(target=target), self.assertRaises(urllib.error.URLError):
+                handler.redirect_request(origin, None, 302, "Found", {}, target)
+        allowed = handler.redirect_request(
+            origin, None, 302, "Found", {}, "https://api.example.test/other"
+        )
+        self.assertIsInstance(allowed, urllib.request.Request)
+        self.assertEqual(allowed and allowed.full_url, "https://api.example.test/other")
 
 
 if __name__ == "__main__":

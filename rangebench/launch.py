@@ -8,6 +8,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,11 @@ from .runner import MAX_CTX_WINDOW
 
 CONFIGS = Path(__file__).resolve().parent.parent / "configs"
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z_0-9]*\Z")
+
+
+def _is_loopback(host: str) -> bool:
+    """Loopback hosts where cleartext HTTP never leaves the machine."""
+    return host == "localhost" or host == "::1" or host.startswith("127.")
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,10 @@ def load_config(path: Path) -> ModelConfig:
         or url.fragment
     ):
         raise ValueError(f"{path.name}: base_url must be an HTTP(S) URL without credentials")
+    # API keys travel in request headers; remote HTTP would expose them on the
+    # wire, so only loopback endpoints may use cleartext HTTP.
+    if url.scheme == "http" and not _is_loopback(url.hostname or ""):
+        raise ValueError(f"{path.name}: remote base_url must use https")
     if not _ENV_NAME.fullmatch(data["api_key_env"]):
         raise ValueError(f"{path.name}: api_key_env must be an environment variable name")
     if data.get("provider", "openai") not in {"openai", "anthropic"}:
@@ -180,9 +190,16 @@ def cmd_launch(args: argparse.Namespace) -> None:
     active: list[subprocess.Popen] = []
     failed = False
     for cmd in commands:
-        if len(active) >= parallel:
-            process = active.pop(0)
-            failed |= process.wait() != 0
+        # Wait for any slot to free up, not the oldest process: a slow first
+        # run must not idle capacity freed by a faster later run.
+        while len(active) >= parallel:
+            done = [process for process in active if process.poll() is not None]
+            if done:
+                for process in done:
+                    active.remove(process)
+                    failed |= process.wait() != 0
+            else:
+                time.sleep(0.05)
         active.append(subprocess.Popen(cmd))
     for process in active:
         failed |= process.wait() != 0
