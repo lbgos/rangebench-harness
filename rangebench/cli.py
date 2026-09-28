@@ -8,6 +8,7 @@ import html
 import json
 import math
 import os
+import re
 import shutil
 import statistics
 import subprocess
@@ -131,16 +132,30 @@ def _print_pass_at_k(attempts: list[dict], trials: int) -> None:
 
 
 def _get_git_commit() -> str | None:
-    for cmd in (["git", "rev-parse", "HEAD"], ["git", "rev-parse", "--short", "HEAD"]):
+    root = TASKS_DIR.parent
+    # Extracted kits must not inherit an unrelated enclosing repository's HEAD.
+    if not (root / ".git").exists():
         try:
-            out = subprocess.run(
-                cmd, cwd=TASKS_DIR.parent, capture_output=True, text=True, timeout=5
-            )
-            if out.returncode == 0 and out.stdout.strip():
-                return out.stdout.strip().splitlines()[0][:40]
-        except Exception:
-            continue
-    return os.environ.get("RANGEBENCH_COMMIT")
+            manifest = json.loads((root / "suite-manifest.json").read_text(encoding="utf-8"))
+            commit = manifest.get("harness_commit")
+            if (
+                manifest.get("harness_source_hash") == _get_harness_hash()
+                and isinstance(commit, str)
+                and re.fullmatch(r"[0-9a-f]{40}", commit)
+            ):
+                return commit
+        except (OSError, ValueError, AttributeError):
+            pass
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, timeout=5
+        )
+        if out.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", out.stdout.strip()):
+            return out.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
 
 
 def _get_attacker_digest() -> str | None:
@@ -917,7 +932,7 @@ def cmd_probe(args: argparse.Namespace) -> None:
 
 
 def cmd_preflight(_args: argparse.Namespace) -> None:
-    """Check docker, compose, and pull all task images without running tasks."""
+    """Check Docker and prepare every target image without starting tasks."""
     if shutil.which("docker") is None:
         print("docker not found", flush=True)
         raise SystemExit(1)
@@ -946,6 +961,12 @@ def cmd_preflight(_args: argparse.Namespace) -> None:
             ["docker", "compose", "-f", str(compose), "pull", "--ignore-buildable", "--quiet"],
             check=True,
             timeout=600,
+        )
+        print(f"[preflight] building {task_dir.name} ...", flush=True)
+        subprocess.run(
+            ["docker", "compose", "-f", str(compose), "build", "--quiet"],
+            check=True,
+            timeout=1800,
         )
     print(f"task set hash: {_get_task_set_hash()}")
     commit = _get_git_commit()
