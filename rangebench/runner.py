@@ -922,10 +922,8 @@ class _AttemptLoop:
                 res.end_reason = "model refusal"
                 self.emit("refusal", n=turn)
                 break
-            if (
-                not content.strip()
-                and response_meta is not None
-                and response_meta.finish_reason is None
+            if not content.strip() and (
+                response_meta is None or response_meta.finish_reason is None
             ):
                 res.end_reason = "empty provider response"
                 self.emit("empty-provider-response", n=turn)

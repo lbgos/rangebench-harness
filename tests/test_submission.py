@@ -96,6 +96,13 @@ def run_doc():
 
 
 class SubmissionTests(unittest.TestCase):
+    def test_validator_rejects_scored_refusal(self):
+        doc = build_submission(run_doc())
+        attempt = next(a for a in doc["attempts"] if a["kind"] == "task")
+        attempt.update(solved=False, scored=True, fail_class="refusal")
+        with self.assertRaisesRegex(ValueError, "inconsistent task outcome"):
+            validate_submission(doc)
+
     def test_real_usage_dict_counts_probe_and_retry_calls(self):
         run = run_doc()
         usage = Usage()

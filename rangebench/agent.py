@@ -499,7 +499,13 @@ def is_refusal(text: str, metadata: ResponseMetadata | None = None) -> bool:
     """
     if metadata is not None and metadata.finish_reason in REFUSAL_FINISH_REASONS:
         return True
-    return bool(_REFUSAL_TEXT_RE.search(text))
+    # Quoted text in an executable payload is not the model refusing the task.
+    prose = COMMAND_RE.sub("", text)
+    prose = ANSWER_RE.sub("", prose)
+    for match in re.finditer(r"```(?:bash|sh|shell)?\s*\n.*?```", prose, re.DOTALL):
+        if parse_turn(match.group())[0]:
+            prose = prose.replace(match.group(), "")
+    return bool(_REFUSAL_TEXT_RE.search(prose))
 
 
 def parse_turn(text: str) -> tuple[list[str], list[str]]:

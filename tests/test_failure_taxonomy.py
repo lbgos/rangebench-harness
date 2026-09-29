@@ -231,6 +231,22 @@ class RefusalTests(unittest.TestCase):
         self.assertFalse(record["scored"])
         self.assertEqual(record["fail_class"], "protocol_error")
 
+    def test_legacy_empty_response_stops_unscored(self) -> None:
+        from rangebench.cli import _attempt_record
+        client = ScriptedClient([""])
+        result, _ = self.run_attempt_with(client)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(result.end_reason, "empty provider response")
+        self.assertEqual(result.refusals, 0)
+        self.assertFalse(_attempt_record(single_stage_task(Path("/tmp")), 1, result, 1.0)["scored"])
+
+    def test_refusal_phrases_in_commands_are_not_refusals(self) -> None:
+        for text in ['COMMAND:\nrg "I cannot help with that request" /work/response.txt',
+                     '```sh\ngrep "I cannot assist" /work/response.txt\n```']:
+            self.assertFalse(is_refusal(text))
+            self.assertTrue(is_refusal(text, ResponseMetadata("refusal", False, False, 8)))
+        self.assertTrue(is_refusal('I cannot help with this.\nCOMMAND:\necho ignored'))
+
     def test_is_refusal_prefers_typed_reason_and_narrow_text(self) -> None:
         self.assertTrue(is_refusal("I can’t assist with that request."))
         self.assertTrue(is_refusal("I'm sorry, but I cannot comply with that."))

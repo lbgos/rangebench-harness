@@ -950,9 +950,10 @@ def cmd_preflight(_args: argparse.Namespace) -> None:
         raise SystemExit("rb-attacker image ID unavailable after build")
     print(f"attacker digest: {digest}")
     for task_dir in sorted(TASKS_DIR.iterdir()):
-        compose = task_dir / "docker-compose.yml"
-        if not compose.exists():
+        if not (task_dir / "task.json").is_file():
             continue
+        task = load_task(task_dir.name)
+        compose = task.dir / task.compose
         print(f"[preflight] pulling {task_dir.name} ...", flush=True)
         subprocess.run(
             ["docker", "compose", "-f", str(compose), "pull", "--ignore-buildable", "--quiet"],

@@ -558,7 +558,10 @@ def validate_submission(doc: dict[str, Any], *, sensitive_values: tuple[str, ...
             raise ValueError("invalid skipped attempt")
         if a["kind"] == "task" and (
             a["solved"] != (a["fail_class"] == "solved")
-            or (a["fail_class"] in {"provider_error", "env_error", "skipped"} and a["scored"])
+            or (
+                a["fail_class"] in {"provider_error", "env_error", "skipped", "refusal"}
+                and a["scored"]
+            )
         ):
             raise ValueError("inconsistent task outcome")
         for key in ("trial", "retry", "turns_used"):
