@@ -775,10 +775,55 @@ class AccountingTests(unittest.TestCase):
             self.assertEqual(run.call_count, 3)
             self.assertIn("attacker", str(run.call_args.args[0]))
 
+    def test_preflight_catches_target_build_failure_before_model_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks = Path(tmp) / "tasks"
+            target = tasks / "sample"
+            target.mkdir(parents=True)
+            (target / "task.json").write_text("{}")
+            (target / "custom.yml").write_text("services: {}")
+            with (
+                patch("rangebench.cli.TASKS_DIR", tasks),
+                patch("rangebench.cli.load_task", return_value=Task("sample", target, "web", 1, "test", compose="custom.yml")),
+                patch("shutil.which", return_value="/usr/bin/docker"),
+                patch("rangebench.cli._get_attacker_digest", return_value="sha256:" + "a" * 64),
+                patch("rangebench.cli.subprocess.run") as run,
+            ):
+                def execute(command, **kwargs):
+                    if command[-2:] == ["build", "--quiet"]:
+                        raise subprocess.CalledProcessError(1, command)
+                    return subprocess.CompletedProcess(command, 0, "ok", "")
+                run.side_effect = execute
+                with self.assertRaises(subprocess.CalledProcessError):
+                    cmd_preflight(argparse.Namespace())
+                self.assertEqual(run.call_args.args[0][-2:], ["build", "--quiet"])
+                compose_calls = [c.args[0] for c in run.call_args_list if "-f" in c.args[0]]
+                self.assertEqual(len(compose_calls), 2)
+                self.assertTrue(all(str(target / "custom.yml") in c for c in compose_calls))
+
+    def test_extracted_kit_does_not_read_parent_git_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch("rangebench.cli.TASKS_DIR", root / "tasks"),
+                patch("rangebench.cli.subprocess.run") as git,
+                patch("rangebench.cli._get_harness_hash", return_value="b" * 16),
+            ):
+                self.assertIsNone(_get_git_commit())
+                (root / "suite-manifest.json").write_text(json.dumps({
+                    "harness_commit": "a" * 40, "harness_source_hash": "b" * 16,
+                }))
+                self.assertEqual(_get_git_commit(), "a" * 40)
+                git.assert_not_called()
+                (root / "suite-manifest.json").write_text(json.dumps({
+                    "harness_commit": "a" * 40, "harness_source_hash": "c" * 16,
+                }))
+                self.assertIsNone(_get_git_commit())
+
     def test_git_commit_is_read_from_benchmark_checkout(self) -> None:
         with patch("rangebench.cli.subprocess.run") as run:
-            run.return_value = subprocess.CompletedProcess([], 0, "deadbeef\n", "")
-            self.assertEqual(_get_git_commit(), "deadbeef")
+            run.return_value = subprocess.CompletedProcess([], 0, "a" * 40 + "\n", "")
+            self.assertEqual(_get_git_commit(), "a" * 40)
             self.assertEqual(run.call_args.kwargs["cwd"], Path(__file__).resolve().parents[1])
 
 

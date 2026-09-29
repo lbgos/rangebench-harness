@@ -51,7 +51,16 @@ FAIL_PROTOCOL = "protocol_error"
 FAIL_BUDGET = "budget_exhausted"
 FAIL_NORMAL = "normal"
 FAIL_SKIPPED = "skipped"
-FAIL_CLASSES = (FAIL_SOLVED, FAIL_PROVIDER, FAIL_ENV, FAIL_PROTOCOL, FAIL_BUDGET, FAIL_NORMAL)
+FAIL_REFUSAL = "refusal"
+FAIL_CLASSES = (
+    FAIL_SOLVED,
+    FAIL_PROVIDER,
+    FAIL_ENV,
+    FAIL_PROTOCOL,
+    FAIL_BUDGET,
+    FAIL_NORMAL,
+    FAIL_REFUSAL,
+)
 
 # Exact end-reason sentinels emitted by run_attempt and cmd_run. Match on
 # those typed values; never substring-match free-form error text.
@@ -72,6 +81,10 @@ _BUDGET_REASONS = frozenset(
 
 def classify_end_reason(end_reason: str, solved: bool) -> str:
     """Map one attempt ending to the taxonomy. Pure function, no I/O."""
+    if end_reason == "empty provider response":
+        return FAIL_PROTOCOL
+    if end_reason == "model refusal":
+        return FAIL_REFUSAL
     if solved:
         return FAIL_SOLVED
     reason = (end_reason or "").strip()
@@ -904,6 +917,17 @@ class _AttemptLoop:
             if reply is None:
                 break
             content, response_meta = reply
+            if is_refusal(content, response_meta):
+                res.refusals += 1
+                res.end_reason = "model refusal"
+                self.emit("refusal", n=turn)
+                break
+            if not content.strip() and (
+                response_meta is None or response_meta.finish_reason is None
+            ):
+                res.end_reason = "empty provider response"
+                self.emit("empty-provider-response", n=turn)
+                break
             if not content.strip():
                 self._handle_empty_reply(turn, content, response_meta)
                 if res.end_reason:

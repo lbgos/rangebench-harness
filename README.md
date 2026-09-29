@@ -21,7 +21,7 @@ python3 -m rangebench probe --model <model> --base-url <url>
 python3 -m rangebench run --model <model> --base-url <url> --trials 3 jwt-none
 ```
 
-`preflight` checks Docker and Compose, builds the attacker image and pulls task images. `identities` prints a content hash per task. `check` runs each task's oracle against a live environment. `probe` sends one request to the model and prints what came back.
+`preflight` checks Docker and Compose, builds the attacker and task images and pulls external task images. `identities` prints a content hash per task. `check` runs each task's oracle against a live environment. `probe` sends one request to the model and prints what came back.
 
 A run needs an OpenAI-compatible `/v1/chat/completions` endpoint. `--base-url` falls back to `$OPENAI_BASE_URL`, then `http://localhost:8000/v1`. `--provider anthropic` switches to the Anthropic `/v1/messages` client. Each run writes a JSONL transcript per attempt, `manifest.json` and `report.html` under `results/`.
 
@@ -37,7 +37,24 @@ python3 -m rangebench launch model-a model-b --parallel 2 --status-dir status
 
 With no names, `launch` prompts on a terminal. It validates all selected profiles, requires their key variables, and probes every endpoint before starting any run. `--dry-run` still probes and may incur API costs. Each profile runs in its own process. `--max-attempts K` and `--infra-retries N` are forwarded to each run; `--status-dir` writes one live JSON file per profile.
 
-A direct run can use `--api-key-env MODEL_API_KEY` (otherwise the usual provider key environment variable is used), `--max-attempts`, `--infra-retries` (default 1), and `--status-json status/model.json`. The cap counts every task environment start, including infra reruns. Errors from the environment, model, or infra timeout may be rerun in a fresh environment; these attempts are unscored and recorded under `infra_attempts`. `live.log` and the status JSON show progress without flags, commands, provider errors, or raw model output. Repeated no-progress wall caps are skipped by default; `--repeat-caps` disables this skip.
+A direct run can use `--api-key-env MODEL_API_KEY` (otherwise the usual provider key environment variable is used), `--max-attempts`, `--infra-retries` (default 1), and `--status-json status/model.json`. The cap counts every task environment start, including infra reruns. Errors from the environment, model, or infra timeout may be rerun in a fresh environment; these attempts are unscored and recorded under `infra_attempts`. `live.log` and the status JSON show progress without flags, commands, provider errors, or raw model output. Repeated no-progress wall caps are skipped by default; `--repeat-caps` disables this skip. A detected model refusal stops immediately, remains unscored, and skips later trials of that task without retrying. Empty provider replies with no finish reason also stop unscored as protocol failures, not refusals. Failed reference probes never start a scored run.
+
+Completed runs also write `results/<run-id>/submission.json`, a standalone, self-reported public result. To export an older run or add public price metadata:
+
+```bash
+python3 -m rangebench export results/<run-id>.json --output submission.json --display-name "Model name" --route-name OpenRouter
+python3 -m rangebench validate-submission submission.json
+```
+
+`--lookup-pricing` fetches an unauthenticated public catalog with an exact model ID match; use `--price-model-id` if the run used an alias. Without lookup, export makes no network request and leaves pricing unknown. Manual rates use `--input-price`, `--output-price`, optional cache rates, `--price-source`, and `--price-date`; all rates are USD per million tokens. Public catalog prices produce an estimate, never a claim about the billed amount. The validator recomputes scores and usage totals and rejects unexpected fields; it does not authenticate who ran the benchmark. The export omits endpoint URLs, credentials, prompts, commands, outputs, flags and raw provider errors.
+
+To stage a validated result for a compatible leaderboard data file:
+
+```bash
+python3 scripts/import-submission.py submission.json leaderboard.json --output updated.json
+```
+
+The importer preserves existing rows and rejects duplicate runs. Different source revisions and partial coverage require `--allow-source-change` and `--allow-partial` after review. It stages JSON only; build and publish it through the site's normal workflow. Unknown costs, tokens and pass@3 remain null and must be rendered as unknown by the site. Adaptive repeat skipping is recorded in `policy.sampling`; pass@k describes the retained trials and should not be presented as a fixed-trial estimate.
 
 For slower inference, `--wall-clock-scale` multiplies caps directly, or `--wall-clock-reference PATH` reads a reference JSON, runs one unscored probe attempt, and scales caps per tier. These options are mutually exclusive. A profile's `wall_clock_reference` forwards the latter option to its run; the reference probe precedes scored task starts and counts toward the attempt cap.
 
@@ -53,7 +70,7 @@ The manifest records the harness source hash, the task-set hash and the attacker
 
 With more than one trial the run prints per-task pass@1 through pass@3 using the unbiased estimator, an overall mean with a Wilson interval, and a pooled Wilson solve rate. Only scored attempts count.
 
-Every attempt ending lands in one class: solved, provider error, env error, protocol error, budget exhausted or normal. Budget exhaustion covers turns, output tokens, wall clock and context, and stays its own class. It is a calibration signal. Folding it into "the agent gave up" would make a slow model look incapable.
+Every attempt ending lands in one class: solved, provider error, env error, protocol error, budget exhausted, refusal or normal. Budget exhaustion covers turns, output tokens, wall clock and context, and stays its own class. It is a calibration signal. Folding it into "the agent gave up" would make a slow model look incapable.
 
 ## Long attempts
 
@@ -61,7 +78,7 @@ When the transcript nears the context window, the runner compacts the middle wit
 
 Command output that is too big for the context goes to `/work/obs/NNNN.log` inside the attacker container. The model sees a bounded preview and the path, and can page through the rest itself.
 
-Each tier has a whole-attempt wall-clock default of 600 seconds for tiers 1 and 2, 1200 for tier 3 and 1800 above. It exists to catch hangs, not to rush the model. A task can set its own `wall_clock` in `task.json`. Tasks have no turn cap unless `task.json` sets `turns` for debugging. The runner records steps and tokens without limiting them.
+Each tier has a whole-attempt wall-clock default of 600 seconds for tier 1, 900 for tier 2, 1500 for tier 3 and 1800 above. It exists to catch hangs, not to rush the model. A task can set its own `wall_clock` in `task.json`. Tasks have no turn cap unless `task.json` sets `turns` for debugging. The runner records steps and tokens without limiting them.
 
 ## Example task
 
@@ -72,3 +89,12 @@ A task is a directory with `task.json`, a Compose file, the target code and `sol
 ## License
 
 MIT.
+
+## Packaging a suite
+
+```bash
+python3 scripts/package-suite.py --tasks-dir /path/to/tasks --output suite.tar.gz task-a task-b
+```
+
+The kit contains the tracked harness runtime files, the attacker image source and only the named task directories. It drops `solution/` unless you pass `--include-solutions`, which oracle checks need. It also leaves out `.git`, caches, and each task's top-level `results/` and `logs/`. Symlinks, `.env` and similar credential files, bad IDs and an existing output file are errors. `suite-manifest.json` records the task IDs, per-task identities, the harness source hash, the task-set hash and a SHA-256 for every file. After extraction, `./run-suite.sh --model <model> --api-key-env MODEL_API_KEY` runs exactly the packaged tasks.
+
