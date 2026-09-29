@@ -40,8 +40,8 @@ def stage_import(
     if not set(incoming) <= set(expected):
         raise ImportRejected("submission contains tasks outside this leaderboard")
     summary = submission["summary"]
-    if not summary["scored"]:
-        raise ImportRejected("submission has no scored attempts")
+    if not summary["recorded"]:
+        raise ImportRejected("submission has no recorded attempts")
     if not allow_partial and (
         set(incoming) != set(expected)
         or summary["pass_at_1_tasks"] != len(expected)
@@ -104,11 +104,11 @@ def stage_import(
         "pass1_tasks": summary["pass_at_1_tasks"],
         "pass3": summary["pass_at_3"],
         "pass3_tasks": summary["pass_at_3_tasks"],
-        "wall_min_per_attempt": sum(a["wall_s"] for a in scored) / len(scored) / 60,
-        "turns_per_attempt": sum(a["turns_used"] for a in scored) / len(scored),
+        "wall_min_per_attempt": sum(a["wall_s"] for a in scored) / len(scored) / 60 if scored else None,
+        "turns_per_attempt": sum(a["turns_used"] for a in scored) / len(scored) if scored else None,
         "output_k_per_attempt": (
             sum(output_values) / len(scored) / 1000
-            if all(v is not None for v in output_values)
+            if scored and all(v is not None for v in output_values)
             else None
         ),
         "input_tokens": usage["input_tokens"],

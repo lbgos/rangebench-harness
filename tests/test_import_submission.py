@@ -106,6 +106,22 @@ class ImportSubmissionTests(unittest.TestCase):
         self.assertIsNone(result["pricing"][row["id"]]["prompt"])
         self.assertEqual(row["output_k_per_attempt"], 0.2)
 
+    def test_refusal_only_submission_is_unranked(self):
+        from tests.test_submission import run_doc
+        board, _ = fixture()
+        run = run_doc()
+        run.update(harness_source_hash="a" * 16, task_set_hash="b" * 16)
+        for a in run["tasks"]:
+            a.update(scored=False, solved=False, fail_class="refusal")
+        submission = build_submission(run)
+        result = stage_import(board, submission, allow_partial=True)
+        row = result["models"][-1]
+        self.assertIsNone(row["pass1"])
+        self.assertEqual(row["scored"], 0)
+        self.assertIsNone(row["wall_min_per_attempt"])
+        self.assertIsNone(row["output_k_per_attempt"])
+        self.assertEqual(row["submission"], submission)
+
     def test_existing_unknown_scores_sort_last(self):
         for missing in (False, True):
             board, submission = fixture()
