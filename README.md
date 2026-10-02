@@ -2,6 +2,16 @@
 
 rangebench runs an LLM agent against containerized attack tasks on your own machine and scores it with pass@k. This repo has the runner and one example task. The scored suites live in a separate private repo.
 
+## Results
+
+[View the benchmark results](https://lbgos.dev/bench/).
+
+[![RangeBench v2 benchmark results](assets/results.png)](https://lbgos.dev/bench/)
+
+## Discussion
+
+[Discuss RangeBench on r/LocalLLaMA](https://www.reddit.com/r/LocalLLaMA/comments/1wvs8va/i_made_my_own_cybersecurity_benchmark_and_ran/).
+
 ## Checks
 
 ```bash
