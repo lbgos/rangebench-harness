@@ -8,9 +8,15 @@ rangebench runs an LLM agent against containerized attack tasks on your own mach
 
 [![RangeBench v2 benchmark results](assets/results.png)](https://lbgos.dev/bench/)
 
+The Qwen 3.8 Flash Next and GLM 5.3 Flash runs are local runs submitted by a participant. They ran on two RTX Pro 6000, with Qwen at NVFP4 and GLM at EXL3, stock and uncensored.
+
 ## Discussion
 
 [Discuss RangeBench on r/LocalLLaMA](https://www.reddit.com/r/LocalLLaMA/comments/1wvs8va/i_made_my_own_cybersecurity_benchmark_and_ran/).
+
+## Private tasks
+
+To run the scored tasks on your own setup, email contact@lbgos.dev or message [@lbgosna](https://x.com/lbgosna) on X.
 
 ## Checks
 
