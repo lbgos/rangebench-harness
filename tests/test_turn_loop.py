@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from rangebench.agent import Usage
+from rangebench.agent import ChatResult, ResponseMetadata, Usage
 from rangebench.env import ATTACKER_IMAGE, Stage, Task
 from rangebench.runner import WRONG_LIMIT, run_attempt
 
@@ -53,9 +53,15 @@ class ScriptedClient:
         return content, usage, error
 
 
+class TypedScriptedClient(ScriptedClient):
+    def chat_result(self, messages, max_tokens, temperature=0.2):
+        content, usage, error = self.chat(messages, max_tokens, temperature)
+        return ChatResult(content, usage, error, ResponseMetadata("stop", not bool(content), False, max_tokens))
+
+
 class TurnLoopTests(unittest.TestCase):
     def test_turn_loop_records_and_feedback(self) -> None:
-        client = ScriptedClient(
+        client = TypedScriptedClient(
             [
                 ("I am not sure yet.", None),
                 ("", None),

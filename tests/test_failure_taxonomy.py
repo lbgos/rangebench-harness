@@ -164,7 +164,8 @@ class RefusalTests(unittest.TestCase):
             ]
         )
         result, records = self.run_attempt_with(client)
-        self.assertEqual(result.end_reason, "all stages captured")
+        self.assertEqual(result.end_reason, "model refusal")
+        self.assertEqual(client.calls, 1)
         self.assertEqual(result.refusals, 1)
         refusal = next(record for record in records if record["kind"] == "refusal")
         self.assertNotIn("content", refusal)
@@ -180,7 +181,8 @@ class RefusalTests(unittest.TestCase):
             ]
         )
         result, records = self.run_attempt_with(client)
-        self.assertEqual(result.end_reason, "all stages captured")
+        self.assertEqual(result.end_reason, "model refusal")
+        self.assertEqual(client.calls, 1)
         self.assertEqual(result.refusals, 1)
         refusal = next(record for record in records if record["kind"] == "refusal")
         self.assertNotIn("content", refusal)
@@ -198,12 +200,52 @@ class RefusalTests(unittest.TestCase):
         self.assertEqual(result.refusals, 0)
         self.assertFalse(any(record["kind"] == "refusal" for record in records))
 
-    def test_empty_typed_refusals_count_while_retry_is_retained(self) -> None:
+    def test_empty_typed_refusal_stops_without_retry(self) -> None:
         client = ScriptedResultClient([("", "refusal")] * 11)
         result, records = self.run_attempt_with(client)
-        self.assertEqual(result.end_reason, "model produced no content 11x")
-        self.assertEqual(result.refusals, 11)
-        self.assertEqual(sum(1 for record in records if record["kind"] == "refusal"), 11)
+        self.assertEqual(result.end_reason, "model refusal")
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(result.refusals, 1)
+        self.assertEqual(sum(1 for record in records if record["kind"] == "refusal"), 1)
+
+    def test_refusal_with_command_never_executes_or_scores(self) -> None:
+        from rangebench.cli import _attempt_record
+
+        client = ScriptedResultClient([("COMMAND:\necho ignored", "content_filter")])
+        result, _ = self.run_attempt_with(client)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(result.commands, 0)
+        record = _attempt_record(single_stage_task(Path("/tmp")), 1, result, 1.0)
+        self.assertFalse(record["scored"])
+        self.assertEqual(record["fail_class"], "refusal")
+
+    def test_empty_unknown_provider_response_stops_unscored(self) -> None:
+        from rangebench.cli import _attempt_record
+
+        client = ScriptedResultClient([("", None)])
+        result, _ = self.run_attempt_with(client)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(result.refusals, 0)
+        self.assertEqual(result.end_reason, "empty provider response")
+        record = _attempt_record(single_stage_task(Path("/tmp")), 1, result, 1.0)
+        self.assertFalse(record["scored"])
+        self.assertEqual(record["fail_class"], "protocol_error")
+
+    def test_legacy_empty_response_stops_unscored(self) -> None:
+        from rangebench.cli import _attempt_record
+        client = ScriptedClient([""])
+        result, _ = self.run_attempt_with(client)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(result.end_reason, "empty provider response")
+        self.assertEqual(result.refusals, 0)
+        self.assertFalse(_attempt_record(single_stage_task(Path("/tmp")), 1, result, 1.0)["scored"])
+
+    def test_refusal_phrases_in_commands_are_not_refusals(self) -> None:
+        for text in ['COMMAND:\nrg "I cannot help with that request" /work/response.txt',
+                     '```sh\ngrep "I cannot assist" /work/response.txt\n```']:
+            self.assertFalse(is_refusal(text))
+            self.assertTrue(is_refusal(text, ResponseMetadata("refusal", False, False, 8)))
+        self.assertTrue(is_refusal('I cannot help with this.\nCOMMAND:\necho ignored'))
 
     def test_is_refusal_prefers_typed_reason_and_narrow_text(self) -> None:
         self.assertTrue(is_refusal("I can’t assist with that request."))
@@ -355,9 +397,9 @@ class ClassifyScriptTests(unittest.TestCase):
         self.assertEqual(
             completed.stdout.strip(),
             f"{results / 'run1.json'}: tried=5 scored=3 solved=1 provider_error=0"
-            " env_error=0 protocol_error=1 budget_exhausted=1 normal=0"
+            " env_error=0 protocol_error=1 budget_exhausted=1 normal=0 refusal=0"
             " | invalid=2 solved=0 provider_error=1 env_error=1 protocol_error=0"
-            " budget_exhausted=0 normal=0",
+            " budget_exhausted=0 normal=0 refusal=0",
         )
 
     def test_results_dir_reads_latest_and_run_dir_reads_sibling_doc(self) -> None:

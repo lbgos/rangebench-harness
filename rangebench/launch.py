@@ -36,6 +36,8 @@ class ModelConfig:
     ctx_window: int
     trials: int
     provider: str = "openai"
+    route_name: str | None = None
+    upstream_provider: str | None = None
     reasoning_effort: str | None = None
     wall_clock_reference: str | None = None
     notes: str = ""
@@ -160,6 +162,8 @@ def cmd_launch(args: argparse.Namespace) -> None:
             "run",
             "--model",
             config.model,
+            "--display-name",
+            config.display_name,
             "--base-url",
             config.base_url,
             "--provider",
@@ -173,6 +177,10 @@ def cmd_launch(args: argparse.Namespace) -> None:
         ]
         if config.reasoning_effort:
             cmd += ["--reasoning-effort", config.reasoning_effort]
+        if config.route_name:
+            cmd += ["--route-name", config.route_name]
+        if config.upstream_provider:
+            cmd += ["--upstream-provider", config.upstream_provider]
         if config.wall_clock_reference:
             cmd += ["--wall-clock-reference", config.wall_clock_reference]
         if args.max_attempts is not None:
