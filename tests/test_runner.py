@@ -1,13 +1,40 @@
+import io
 import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from rangebench.agent import ChatResult, ResponseMetadata, Usage
+from rangebench.agent import ChatClient, ChatResult, ResponseMetadata, Usage
+from rangebench.budget import BudgetAuthority, BudgetedChatClient, BudgetLimits
 from rangebench.env import ATTACKER_IMAGE, EnvError, Stage, Task, TaskEnv, load_all, truncate_output
-from rangebench.runner import run_attempt, run_oracle
+from rangebench.runner import HarnessPolicy, run_attempt, run_oracle
+
+
+class FakeResponse:
+    def __init__(self, body: dict):
+        self.body = body
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps(self.body).encode()
+
+
+def _http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        "https://example.test/v1",
+        code,
+        "provider",
+        {},
+        io.BytesIO(b'{"error":"payload too large"}'),
+    )
 
 
 class FakeEnv:
@@ -433,5 +460,259 @@ class RunnerTests(unittest.TestCase):
                 run_oracle(task)
 
 
+class HarnessPolicyTests(unittest.TestCase):
+    def _task(self, tmp: str) -> Task:
+        return Task(
+            "sample",
+            Path(tmp),
+            "web",
+            1,
+            "Find the flag",
+            stages=[Stage("one", "/flag", "target")],
+            turns=8,
+        )
+
+    def test_repeated_command_emits_a_loop_break(self) -> None:
+        class Repeater:
+            def chat(self, _messages: list[dict], max_tokens: int, temperature: float = 0.2):
+                return "COMMAND:\nls /work", Usage(), None
+
+        with tempfile.TemporaryDirectory() as tmp, patch("rangebench.runner.TaskEnv", FakeEnv):
+            task = self._task(tmp)
+            run_attempt(
+                Repeater(),
+                task,
+                1,
+                "rb-test",
+                Path(tmp),
+                verbose=False,
+                policy=HarnessPolicy(supervisor_every=0),
+            )
+            log = (Path(tmp) / "sample-t1.jsonl").read_text()
+        self.assertIn('"kind": "loop-break"', log)
+
+    def test_supervisor_runs_every_n_turns_and_injects_advice(self) -> None:
+        class SupervisorClient:
+            def __init__(self) -> None:
+                self.supervisor_calls = 0
+                self.main_prompts: list[list[dict]] = []
+
+            def chat(self, messages: list[dict], max_tokens: int, temperature: float = 0.2):
+                if messages[0]["content"].startswith("You supervise"):
+                    self.supervisor_calls += 1
+                    return "Try a different endpoint: /admin", Usage(calls=1), None
+                self.main_prompts.append(messages)
+                return "COMMAND:\ncurl -s http://target/", Usage(calls=1), None
+
+        client = SupervisorClient()
+        with tempfile.TemporaryDirectory() as tmp, patch("rangebench.runner.TaskEnv", FakeEnv):
+            task = self._task(tmp)
+            run_attempt(
+                client,
+                task,
+                1,
+                "rb-test",
+                Path(tmp),
+                verbose=False,
+                policy=HarnessPolicy(loop_break=False, supervisor_every=2),
+            )
+            log = (Path(tmp) / "sample-t1.jsonl").read_text()
+        self.assertGreaterEqual(client.supervisor_calls, 1)
+        self.assertIn('"kind": "supervisor"', log)
+        self.assertTrue(
+            any(
+                "[SUPERVISOR NOTE" in str(m.get("content"))
+                for prompt in client.main_prompts
+                for m in prompt
+            )
+        )
+
+
+class FlagProvenanceTests(unittest.TestCase):
+    def _task(self, tmp: str) -> Task:
+        return Task(
+            "sample",
+            Path(tmp),
+            "web",
+            1,
+            "Find the flag",
+            stages=[Stage("one", "/flag", "target")],
+            turns=3,
+        )
+
+    def test_flag_is_not_accepted_before_it_appears_in_an_observation(self) -> None:
+        class Guesser:
+            def chat(self, _messages: list[dict], max_tokens: int, temperature: float = 0.2):
+                return "ANSWER: flag{test}", Usage(), None
+
+        with tempfile.TemporaryDirectory() as tmp, patch("rangebench.runner.TaskEnv", FakeEnv):
+            task = self._task(tmp)
+            result = run_attempt(
+                Guesser(),
+                task,
+                1,
+                "rb-test",
+                Path(tmp),
+                verbose=False,
+                policy=HarnessPolicy(loop_break=False, require_observed_flag=True),
+            )
+            log = (Path(tmp) / "sample-t1.jsonl").read_text()
+        self.assertEqual(result.solved, [])
+        self.assertEqual(result.wrong, 0)
+        self.assertIn('"kind": "unobserved-submission"', log)
+
+    def test_flag_is_accepted_after_it_appears_in_an_observation(self) -> None:
+        class FlagEnv(FakeEnv):
+            def exec(self, cmd: str, **_kwargs: object) -> tuple[int, str]:
+                return 0, "flag{test}" if "cat" in cmd else ""
+
+        class Reader:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def chat(self, _messages: list[dict], max_tokens: int, temperature: float = 0.2):
+                self.calls += 1
+                if self.calls == 1:
+                    return "COMMAND:\ncat /flag", Usage(), None
+                return "ANSWER: flag{test}", Usage(), None
+
+        with tempfile.TemporaryDirectory() as tmp, patch("rangebench.runner.TaskEnv", FlagEnv):
+            task = self._task(tmp)
+            result = run_attempt(
+                Reader(),
+                task,
+                1,
+                "rb-test",
+                Path(tmp),
+                verbose=False,
+                policy=HarnessPolicy(loop_break=False, require_observed_flag=True),
+            )
+        self.assertEqual(result.solved, ["one"])
+
+
+class MultiCommandTests(unittest.TestCase):
+    def test_all_command_blocks_run_in_order(self) -> None:
+        class TwoCommandClient:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.messages: list[list[dict]] = []
+
+            def chat(self, messages: list[dict], max_tokens: int, temperature: float = 0.2):
+                self.calls += 1
+                self.messages.append(messages)
+                if self.calls == 1:
+                    return "COMMAND:\nfirst\n\nCOMMAND:\nsecond", Usage(), None
+                return "ANSWER: flag{test}", Usage(), None
+
+        class RecordingEnv(FakeEnv):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                super().__init__(*args, **kwargs)
+                self.commands: list[str] = []
+
+            def exec(self, cmd: str, **_kwargs: object) -> tuple[int, str]:
+                self.commands.append(cmd)
+                return 0, cmd
+
+        client = TwoCommandClient()
+        with tempfile.TemporaryDirectory() as tmp, patch("rangebench.runner.TaskEnv", RecordingEnv):
+            task = Task(
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+                turns=2,
+            )
+            result = run_attempt(
+                client,
+                task,
+                1,
+                "rb-test",
+                Path(tmp),
+                verbose=False,
+                policy=HarnessPolicy(loop_break=False, execute_all_commands=True),
+            )
+            log = (Path(tmp) / "sample-t1.jsonl").read_text()
+        self.assertEqual(result.commands, 2)
+        self.assertIn('"kind": "multi-command"', log)
+        feedback = "\n".join(str(m.get("content")) for m in client.messages[1])
+        self.assertIn("OBSERVATION 1/2", feedback)
+        self.assertIn("OBSERVATION 2/2", feedback)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContextRetry413Tests(unittest.TestCase):
+    def test_413_rejection_halves_context_then_settles(self) -> None:
+        now = [1000.0]
+
+        def fake_time() -> float:
+            return now[0]
+
+        body = {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": "ANSWER: flag{test}"},
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            task = Task(
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+            )
+            authority = BudgetAuthority(
+                Path(tmp) / "budget.jsonl",
+                BudgetLimits(
+                    max_attempts=1,
+                    max_requests=10,
+                    max_requests_per_attempt=8,
+                    max_tokens=100_000,
+                    max_spend_usd=None,
+                    input_usd_per_million=None,
+                    output_usd_per_million=None,
+                    deadline_epoch=10**12,
+                    ctx_window=1000,
+                ),
+            )
+            client = BudgetedChatClient(
+                ChatClient("http://localhost:8000/v1", "placeholder", "model"),
+                authority,
+                "sample-t1",
+            )
+            with (
+                patch("rangebench.runner.TaskEnv", FakeEnv),
+                patch("rangebench.runner.time.time", side_effect=fake_time),
+                patch(
+                    "rangebench.agent.urllib.request.urlopen",
+                    side_effect=[_http_error(413), FakeResponse(body)],
+                ) as urlopen,
+            ):
+                result = run_attempt(
+                    client,
+                    task,
+                    1,
+                    "rb-test",
+                    Path(tmp),
+                    verbose=False,
+                    ctx_window=1000,
+                    use_llm_compact=False,
+                )
+        self.assertEqual(result.end_reason, "all stages captured")
+        self.assertEqual(result.effective_ctx_window, 500)
+        self.assertEqual(result.solved, ["one"])
+        self.assertEqual(urlopen.call_count, 2)
+        snapshot = authority.snapshot()
+        self.assertEqual(snapshot.requests, 2)
+        self.assertEqual(snapshot.rejected_requests, 1)
+        self.assertEqual(snapshot.tokens, 15)
+        self.assertFalse(snapshot.unknown)

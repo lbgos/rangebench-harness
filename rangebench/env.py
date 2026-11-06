@@ -129,10 +129,12 @@ class Task:
         return len(self.stages) > 1
 
 
-def load_task(task_id: str) -> Task:
-    d = TASKS_DIR / task_id
+def load_task(task_id: str, tasks_dir: Path | None = None) -> Task:
+    """Load one task from tasks_dir, defaulting to this checkout's tasks/."""
+    base = TASKS_DIR if tasks_dir is None else tasks_dir
+    d = base / task_id
     if not d.is_dir():
-        known = ", ".join(sorted(p.name for p in TASKS_DIR.iterdir() if (p / "task.json").exists()))
+        known = ", ".join(sorted(p.name for p in base.iterdir() if (p / "task.json").exists()))
         raise EnvError(f"unknown task {task_id}; known: {known}")
     raw = json.loads((d / "task.json").read_text())
     stages = [Stage(**s) for s in raw.get("stages", [])]
@@ -172,8 +174,10 @@ def load_task(task_id: str) -> Task:
     )
 
 
-def load_all() -> list[Task]:
-    return [load_task(p.name) for p in sorted(TASKS_DIR.iterdir()) if (p / "task.json").exists()]
+def load_all(tasks_dir: Path | None = None) -> list[Task]:
+    """Load every task directory that ships a task.json."""
+    base = TASKS_DIR if tasks_dir is None else tasks_dir
+    return [load_task(p.name, base) for p in sorted(base.iterdir()) if (p / "task.json").exists()]
 
 
 def _run(cmd: list[str], timeout: int = 300, check: bool = True) -> subprocess.CompletedProcess:

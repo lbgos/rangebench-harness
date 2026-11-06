@@ -10,7 +10,13 @@ from unittest.mock import patch
 from rangebench.agent import Usage
 from rangebench.cli import cmd_probe, cmd_run, main
 from rangebench.env import ATTACKER_IMAGE, EnvError, Stage, Task, load_task, wall_clock_default
-from rangebench.runner import AttemptResult, run_attempt, transcript_tps, wall_clock_scale_for
+from rangebench.runner import (
+    AttemptResult,
+    is_scored_end_reason,
+    run_attempt,
+    transcript_tps,
+    wall_clock_scale_for,
+)
 
 PROBE_ID = "jwt-none"
 
@@ -59,6 +65,17 @@ class LoopClient:
     def chat(
         self, _messages: list[dict], max_tokens: int, temperature: float = 0.2
     ) -> tuple[str, Usage, None]:
+        return "COMMAND:\ntrue", Usage(), None
+
+
+class CountingLoopClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(
+        self, _messages: list[dict], max_tokens: int, temperature: float = 0.2
+    ) -> tuple[str, Usage, None]:
+        self.calls += 1
         return "COMMAND:\ntrue", Usage(), None
 
 
@@ -198,6 +215,169 @@ class WallClockTests(unittest.TestCase):
         # under its own per-command timeout, and the trip fired between turns.
         self.assertEqual(result.commands, 1)
         self.assertEqual(envs[-1].seen_timeouts, [120])
+
+    def test_shared_deadline_between_turns_is_unscored_experiment_stop(self) -> None:
+        now = [1000.0]
+
+        def fake_time() -> float:
+            return now[0]
+
+        def advancing_exec(_env: FakeEnv, _cmd: str, **_kwargs: object) -> tuple[int, str]:
+            now[0] += 60.0
+            return 0, ""
+
+        client = CountingLoopClient()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("rangebench.runner.TaskEnv", FakeEnv),
+            patch.object(FakeEnv, "exec", advancing_exec),
+            patch("rangebench.runner.time.time", side_effect=fake_time),
+        ):
+            task = Task(
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+                wall_clock=600,
+            )
+            result = run_attempt(
+                client,
+                task,
+                1,
+                "rb-test",
+                Path(tmp),
+                verbose=False,
+                deadline_epoch=1060.0,
+            )
+            records = [
+                json.loads(line)
+                for line in (Path(tmp) / "sample-t1.jsonl").read_text().splitlines()
+            ]
+        self.assertEqual(result.end_reason, "experiment budget: runtime")
+        self.assertFalse(is_scored_end_reason(result.end_reason))
+        self.assertFalse(result.wall_clock_exceeded)
+        self.assertEqual(result.wall_clock_seconds, 600)
+        self.assertEqual(result.turns_used, 1)
+        self.assertEqual(client.calls, 1)
+        stop = next(record for record in records if record["kind"] == "budget-stop")
+        self.assertEqual(stop["reason"], "runtime")
+
+    def test_shared_deadline_on_final_turn_is_unscored_experiment_stop(self) -> None:
+        now = [1000.0]
+
+        def fake_time() -> float:
+            return now[0]
+
+        def advancing_exec(_env: FakeEnv, _cmd: str, **_kwargs: object) -> tuple[int, str]:
+            now[0] += 60.0
+            return 0, ""
+
+        client = CountingLoopClient()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("rangebench.runner.TaskEnv", FakeEnv),
+            patch.object(FakeEnv, "exec", advancing_exec),
+            patch("rangebench.runner.time.time", side_effect=fake_time),
+        ):
+            task = Task(
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+                turns=1,
+                wall_clock=600,
+            )
+            result = run_attempt(
+                client,
+                task,
+                1,
+                "rb-test",
+                Path(tmp),
+                verbose=False,
+                deadline_epoch=1060.0,
+            )
+        self.assertEqual(result.end_reason, "experiment budget: runtime")
+        self.assertFalse(is_scored_end_reason(result.end_reason))
+        self.assertFalse(result.wall_clock_exceeded)
+        self.assertEqual(result.wall_clock_seconds, 600)
+        self.assertEqual(client.calls, 1)
+
+    def test_shared_deadline_before_start_skips_provider(self) -> None:
+        now = [1000.0]
+
+        def fake_time() -> float:
+            return now[0]
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("rangebench.runner.TaskEnv", FakeEnv),
+            patch("rangebench.runner.time.time", side_effect=fake_time),
+        ):
+            task = Task(
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+                wall_clock=60,
+            )
+            result = run_attempt(
+                NoCallsClient(),
+                task,
+                1,
+                "rb-test",
+                Path(tmp),
+                verbose=False,
+                deadline_epoch=1000.0,
+            )
+        self.assertEqual(result.end_reason, "experiment budget: runtime")
+        self.assertFalse(is_scored_end_reason(result.end_reason))
+        self.assertFalse(result.wall_clock_exceeded)
+        self.assertEqual(result.wall_clock_seconds, 60)
+
+    def test_exact_task_wall_boundary_stays_scored(self) -> None:
+        now = [1000.0]
+
+        def fake_time() -> float:
+            return now[0]
+
+        def advancing_exec(_env: FakeEnv, _cmd: str, **_kwargs: object) -> tuple[int, str]:
+            now[0] += 60.0
+            return 0, ""
+
+        client = CountingLoopClient()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("rangebench.runner.TaskEnv", FakeEnv),
+            patch.object(FakeEnv, "exec", advancing_exec),
+            patch("rangebench.runner.time.time", side_effect=fake_time),
+        ):
+            task = Task(
+                "sample",
+                Path(tmp),
+                "web",
+                1,
+                "Find the flag",
+                stages=[Stage("one", "/flag", "target")],
+                wall_clock=60,
+            )
+            result = run_attempt(
+                client,
+                task,
+                1,
+                "rb-test",
+                Path(tmp),
+                verbose=False,
+            )
+        self.assertEqual(result.end_reason, "wall_clock_exceeded")
+        self.assertTrue(is_scored_end_reason(result.end_reason))
+        self.assertTrue(result.wall_clock_exceeded)
+        self.assertEqual(client.calls, 1)
 
     def test_env_setup_failure_retains_wall_clock_cap(self) -> None:
         class FailingEnv(FakeEnv):

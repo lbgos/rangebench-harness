@@ -77,6 +77,12 @@ When the transcript nears the context window, the runner compacts the middle wit
 
 Command output that is too big for the context goes to `/work/obs/NNNN.log` inside the attacker container. The model sees a bounded preview and the path, and can page through the rest itself.
 
+## Harness behavior
+
+A model turn can use the documented `COMMAND:` block, a fenced bash block, or native DeepSeek `｜DSML｜` tool-call markup. Trailing chatter and duplicate tool-call markup are stripped before the command runs.
+
+The default executes one command per turn. `--execute-all-commands` executes up to six blocks in order and returns each observation. `--require-observed-flag` rejects an `ANSWER:` until that exact value appeared in a command observation. `--supervisor-every N` asks a second model call for a short diagnosis every N turns and injects it as advice. `--no-loop-break` disables repeated-command and unchanged-observation nudges. `--max-tokens-per-turn N` caps generation per turn; `0` keeps the task maximum, and `8192` is a useful default for chatty models.
+
 Each tier has a whole-attempt wall-clock default of 600 seconds for tiers 1 and 2, 1200 for tier 3 and 1800 above. It exists to catch hangs, not to rush the model. A task can set its own `wall_clock` in `task.json`. Tasks have no turn cap unless `task.json` sets `turns` for debugging. The runner records steps and tokens without limiting them.
 
 ## Example task
