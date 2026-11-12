@@ -2,6 +2,8 @@
 
 rangebench runs an LLM agent against containerized attack tasks on your own machine and scores it with pass@k. This repo has the runner and one example task. The scored suites live in a separate private repo.
 
+RangeBench v3 updates the runner with native tool-call parsing, multi-command turns, observation-backed flag submission, loop breaking, and an optional supervisor. The task format and scoring stay unchanged.
+
 ## Results
 
 [View the benchmark results](https://lbgos.dev/bench/).
