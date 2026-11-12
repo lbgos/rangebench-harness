@@ -2,6 +2,8 @@
 
 rangebench runs an LLM agent against containerized attack tasks on your own machine and scores it with pass@k. This repo has the runner and one example task. The scored suites live in a separate private repo.
 
+RangeBench v3 updates the runner with native tool-call parsing, multi-command turns, observation-backed flag submission, loop breaking, and an optional supervisor. The task format and scoring stay unchanged.
+
 ## Results
 
 [View the benchmark results](https://lbgos.dev/bench/).
@@ -76,6 +78,12 @@ Every attempt ending lands in one class: solved, provider error, env error, prot
 When the transcript nears the context window, the runner compacts the middle with an LLM summary by default. Confirmed stage captures and wrong-submission counts go in a separate block outside the summary, so a lossy summary can't drop a solved stage. If the LLM call fails, a deterministic trim takes over. `--compact deterministic` skips the LLM entirely.
 
 Command output that is too big for the context goes to `/work/obs/NNNN.log` inside the attacker container. The model sees a bounded preview and the path, and can page through the rest itself.
+
+## Harness behavior
+
+A model turn can use the documented `COMMAND:` block, a fenced bash block, or native DeepSeek `｜DSML｜` tool-call markup. Trailing chatter and duplicate tool-call markup are stripped before the command runs.
+
+The default executes one command per turn. `--execute-all-commands` executes up to six blocks in order and returns each observation. `--require-observed-flag` rejects an `ANSWER:` until that exact value appeared in a command observation. `--supervisor-every N` asks a second model call for a short diagnosis every N turns and injects it as advice. `--no-loop-break` disables repeated-command and unchanged-observation nudges. `--max-tokens-per-turn N` caps generation per turn; `0` keeps the task maximum, and `8192` is a useful default for chatty models.
 
 Each tier has a whole-attempt wall-clock default of 600 seconds for tiers 1 and 2, 1200 for tier 3 and 1800 above. It exists to catch hangs, not to rush the model. A task can set its own `wall_clock` in `task.json`. Tasks have no turn cap unless `task.json` sets `turns` for debugging. The runner records steps and tokens without limiting them.
 

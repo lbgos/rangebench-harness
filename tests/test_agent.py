@@ -1,3 +1,4 @@
+import io
 import json
 import unittest
 import urllib.error
@@ -10,6 +11,7 @@ from rangebench.agent import (
     ChatResult,
     ResponseMetadata,
     _CredentialSafeRedirectHandler,
+    parse_turn,
 )
 
 
@@ -25,6 +27,16 @@ class FakeResponse:
 
     def read(self) -> bytes:
         return json.dumps(self.body).encode()
+
+
+def _http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        "https://example.test/v1",
+        code,
+        "provider",
+        {},
+        io.BytesIO(b'{"error":"provider"}'),
+    )
 
 
 class ResponseMetadataTests(unittest.TestCase):
@@ -145,6 +157,118 @@ class ResponseMetadataTests(unittest.TestCase):
         )
         self.assertIsInstance(allowed, urllib.request.Request)
         self.assertEqual(allowed and allowed.full_url, "https://api.example.test/other")
+
+
+class HTTPErrorClassificationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.messages = [{"role": "user", "content": "test"}]
+
+    def _clients(self) -> tuple[tuple[str, ChatClient], tuple[str, AnthropicChatClient]]:
+        return (
+            ("openai", ChatClient("https://example.test/v1", "placeholder", "model")),
+            ("anthropic", AnthropicChatClient("https://example.test", "placeholder", "model")),
+        )
+
+    def test_429_is_a_definitive_rejection_for_both_handlers(self) -> None:
+        for name, client in self._clients():
+            with (
+                self.subTest(name),
+                patch(
+                    "rangebench.agent.urllib.request.urlopen",
+                    side_effect=_http_error(429),
+                ),
+            ):
+                result = client.chat_result(self.messages, max_tokens=16)
+            self.assertTrue((result.error or "").startswith("HTTP 429:"), result.error)
+            self.assertFalse((result.error or "").startswith("transport:"))
+            self.assertEqual(result.usage.requests, 1)
+            self.assertEqual(result.usage.calls, 0)
+            self.assertEqual(result.usage.input_tokens + result.usage.output_tokens, 0)
+
+    def test_413_is_a_definitive_rejection_for_both_handlers(self) -> None:
+        for name, client in self._clients():
+            with (
+                self.subTest(name),
+                patch(
+                    "rangebench.agent.urllib.request.urlopen",
+                    side_effect=_http_error(413),
+                ),
+            ):
+                result = client.chat_result(self.messages, max_tokens=16)
+            self.assertTrue((result.error or "").startswith("HTTP 413:"), result.error)
+            self.assertFalse((result.error or "").startswith("transport:"))
+            self.assertEqual(result.usage.requests, 1)
+            self.assertEqual(result.usage.calls, 0)
+            self.assertEqual(result.usage.input_tokens + result.usage.output_tokens, 0)
+
+    def test_503_remains_transport_for_both_handlers(self) -> None:
+        for name, client in self._clients():
+            with (
+                self.subTest(name),
+                patch(
+                    "rangebench.agent.urllib.request.urlopen",
+                    side_effect=_http_error(503),
+                ),
+            ):
+                result = client.chat_result(self.messages, max_tokens=16)
+            self.assertTrue((result.error or "").startswith("transport: HTTP 503:"), result.error)
+
+
+class ParseTurnTests(unittest.TestCase):
+    def test_command_block_with_duplicate_dsml_keeps_one_clean_command(self) -> None:
+        text = (
+            "\n\nCOMMAND:\nls -la /work/quote/ && file /work/quote/*\n\n"
+            "<\uff5cDSML\uff5c calls>\n"
+            '<\uff5cDSML\uff5c invoke name="bash">\n'
+            '<\uff5cDSML\uff5c parameter name="command" string="true">'
+            "ls -la /work/quote/ && file /work/quote/*"
+            "</\uff5cDSML\uff5c parameter>\n"
+            "</\uff5cDSML\uff5c invoke>\n"
+            "</\uff5cDSML\uff5c calls>"
+        )
+        commands, answers = parse_turn(text)
+        self.assertEqual(commands, ["ls -la /work/quote/ && file /work/quote/*"])
+        self.assertEqual(answers, [])
+
+    def test_dsml_only_turn_is_a_command(self) -> None:
+        text = (
+            "<\uff5cDSML\uff5c calls>\n"
+            '<\uff5cDSML\uff5c invoke name="bash">\n'
+            '<\uff5cDSML\uff5c parameter name="command" string="true">'
+            "strings -n 8 /work/quote/quote | grep -i seccomp"
+            "</\uff5cDSML\uff5c parameter>\n"
+            "</\uff5cDSML\uff5c invoke>\n"
+            "</\uff5cDSML\uff5c calls>"
+        )
+        commands, _ = parse_turn(text)
+        self.assertEqual(commands, ["strings -n 8 /work/quote/quote | grep -i seccomp"])
+
+    def test_privacy_event_is_not_part_of_the_command(self) -> None:
+        text = (
+            "COMMAND:\ncurl -s http://portal:8080/\n\n"
+            "<privacy_event>I cannot see the output.</privacy_event>"
+        )
+        commands, _ = parse_turn(text)
+        self.assertEqual(commands, ["curl -s http://portal:8080/"])
+
+    def test_answer_is_still_parsed(self) -> None:
+        commands, answers = parse_turn("ANSWER: flag{abc}")
+        self.assertEqual(commands, [])
+        self.assertEqual(answers, ["flag{abc}"])
+
+
+class CommandCleanupTests(unittest.TestCase):
+    def test_trailing_prose_is_not_part_of_the_command(self) -> None:
+        commands, _ = parse_turn("COMMAND:\nls -la /work\nLet me inspect the binary.")
+        self.assertEqual(commands, ["ls -la /work"])
+
+    def test_fabricated_observation_is_cut(self) -> None:
+        commands, _ = parse_turn("COMMAND:\ncat /flag\nOBSERVATION:\nflag{deadbeef}")
+        self.assertEqual(commands, ["cat /flag"])
+
+    def test_think_tag_is_removed(self) -> None:
+        commands, _ = parse_turn("COMMAND:\nls /work</think>")
+        self.assertEqual(commands, ["ls /work"])
 
 
 if __name__ == "__main__":

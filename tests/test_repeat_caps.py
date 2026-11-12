@@ -103,15 +103,19 @@ class RepeatCapsTests(unittest.TestCase):
             self.assertEqual(record["turns_used"], 0)
             self.assertEqual(record["wall_s"], 0)
             for key, value in record.items():
-                if key != "max_output_tokens" and ("tokens" in key or key in {
-                    "api_calls",
-                    "api_requests",
-                    "usage_reported_calls",
-                    "input_reported_calls",
-                    "output_reported_calls",
-                    "cache_read_reported_calls",
-                    "cache_write_reported_calls",
-                }):
+                if key != "max_output_tokens" and (
+                    "tokens" in key
+                    or key
+                    in {
+                        "api_calls",
+                        "api_requests",
+                        "usage_reported_calls",
+                        "input_reported_calls",
+                        "output_reported_calls",
+                        "cache_read_reported_calls",
+                        "cache_write_reported_calls",
+                    }
+                ):
                     self.assertEqual(value, 0, key)
         self.assertEqual([item["trial"] for item in manifest["service_image_ids"]], [1])
 

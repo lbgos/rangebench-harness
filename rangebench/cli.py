@@ -33,7 +33,9 @@ from .runner import (
     MAX_CTX_WINDOW,
     MAX_WALL_CLOCK_SCALE,
     AttemptResult,
+    HarnessPolicy,
     classify_end_reason,
+    is_scored_end_reason,
     run_attempt,
     run_oracle,
     transcript_tps,
@@ -419,6 +421,13 @@ def _attempt(
         model_tps=model_tps,
         on_event=on_event,
         log_suffix=log_suffix,
+        policy=HarnessPolicy(
+            loop_break=not getattr(args, "no_loop_break", False),
+            supervisor_every=getattr(args, "supervisor_every", 0),
+            execute_all_commands=getattr(args, "execute_all_commands", False),
+            require_observed_flag=getattr(args, "require_observed_flag", False),
+            max_tokens_per_turn=getattr(args, "max_tokens_per_turn", 0),
+        ),
     )
 
 
@@ -512,10 +521,7 @@ def _attempt_record(task: Task, trial: int, res: AttemptResult, task_scale: floa
         "solved_stages": res.solved,
         "stages_total": [s.name for s in task.stages],
         "solved": solved,
-        "scored": not (
-            res.end_reason.startswith("env:")
-            or res.end_reason in {"infra timeout", "llm error", "context window exhausted"}
-        ),
+        "scored": is_scored_end_reason(res.end_reason),
         "fail_class": classify_end_reason(res.end_reason, solved),
         "wrong": res.wrong,
         "refusals": res.refusals,
@@ -766,7 +772,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 retrying = (
                     infra_failure and retry < infra_retries and progress.used < progress.limit
                 )
-                scored = not (infra_failure or res.end_reason == "context window exhausted")
+                scored = is_scored_end_reason(res.end_reason)
                 solved = sorted(res.solved) == sorted(s.name for s in task.stages)
                 progress.end(tid, trial, res, scored, solved, retrying)
                 if infra_failure:
@@ -980,6 +986,33 @@ def main() -> None:
         choices=["deterministic", "llm"],
         default="llm",
         help="compaction mode, same-model llm is the default",
+    )
+    run.add_argument(
+        "--supervisor-every",
+        type=int,
+        default=0,
+        help="ask a second agent for a diagnosis every N turns (0 disables)",
+    )
+    run.add_argument(
+        "--no-loop-break",
+        action="store_true",
+        help="disable repeated-command and unchanged-observation nudges",
+    )
+    run.add_argument(
+        "--execute-all-commands",
+        action="store_true",
+        help="execute up to six COMMAND blocks per turn instead of only the first",
+    )
+    run.add_argument(
+        "--require-observed-flag",
+        action="store_true",
+        help="reject a submitted flag until it appears in a command observation",
+    )
+    run.add_argument(
+        "--max-tokens-per-turn",
+        type=int,
+        default=0,
+        help="cap generation per turn; 0 keeps the task max (recommended: 8192)",
     )
     run.add_argument(
         "--reasoning-effort",
