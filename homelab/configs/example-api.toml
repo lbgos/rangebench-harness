@@ -1,0 +1,10 @@
+# A hosted OpenAI-compatible endpoint. The key is read from the named env var, never stored here.
+display_name = "Hosted model"
+base_url = "https://api.example.com/v1"
+api_key_env = "MODEL_API_KEY"
+model = "provider-model-id"
+ctx_window = 200000
+concurrency = 4
+
+[extra]                # merged into every request
+reasoning_effort = "medium"

@@ -6,3 +6,6 @@ __pycache__/
 experiments/
 .tools/
 .coderabbit-install.sh
+cyber/suite/
+homelab/suite/
+homelab/.work/
