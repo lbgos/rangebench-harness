@@ -1,0 +1,8 @@
+# A local OpenAI-compatible server (llama.cpp, vLLM, SGLang) on this machine.
+display_name = "Local model"
+base_url = "http://127.0.0.1:8000/v1"
+api_key_env = ""
+model = "local-model"
+ctx_window = 131072
+concurrency = 1        # one GPU: sessions run one after another
+wall_clock_scale = 4.0 # slow decoding: hang guards scale by this

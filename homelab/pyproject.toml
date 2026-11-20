@@ -1,0 +1,41 @@
+[project]
+name = "rangebench-homelab"
+version = "0.1.0"
+description = "long-session homelab ops bench for LLM agents"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.setuptools]
+packages = ["rangebench_homelab"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+# Simulator tables, GitHub mock payloads, chart CSS, ask phrase lists and example world text.
+"rangebench_homelab/sim.py" = ["E501", "SIM905"]
+"rangebench_homelab/gh.py" = ["E501"]
+"rangebench_homelab/chart.py" = ["E501"]
+"rangebench_homelab/asks.py" = ["E501"]
+"rangebench_homelab/rater.py" = ["E501"]  # rubric prompt text
+"templates/example/*.py" = ["E501"]
+"tests/*.py" = ["E501"]  # shell commands, regexes and payloads as fixtures
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_any_generics = false
+ignore_missing_imports = true
+warn_unused_ignores = false
