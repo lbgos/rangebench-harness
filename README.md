@@ -1,11 +1,23 @@
 # RangeBench
 
-Two benchmarks for LLM agents that run on your own machine. Each tree has its harness and one example task. The scored tasks are private.
+RangeBench has two benchmarks for LLM agents. Each comes with a public harness and one example. The scored suites are private.
 
-- `cyber/`: RangeBench cyber. The agent attacks containerized targets and submits flags; scored with pass@k.
-- `homelab/`: RangeBench homelab. The agent works through a long ops session (20 chained steps) in a simulated multi-host world; scored by step pass rate by position, false-done and rule violations.
+| Benchmark | What it measures | Scoring |
+| --- | --- | --- |
+| [HomeLab](homelab/) | Operations and coding across chained steps in a persistent, simulated multi-host environment. | Step pass rate by position, false-done rate, and rule violations. |
+| [Cyber](cyber/) | How often an agent solves isolated security challenges. | Pass@k across independent attempts. |
 
-## Results
+## HomeLab results
+
+Medium has 12 sessions with five steps each. A step passes when its checks succeed and no rule violation is recorded. False done means the agent claimed success on a step that failed its checks.
+
+[![HomeLab Medium results for nine models. Opus passed 53/60, GPT-6.2 Sol 41/60, Haiku 33/60, and GPT-6 Luna 22/60.](assets/homelab-medium.png)](assets/homelab-medium.png)
+
+Edge0 145B passed **13 of 22** completed steps in a partial Medium run. This comparison uses the same 22 steps for every model; one Fable API error is excluded from scoring.
+
+[![HomeLab partial Medium comparison. Edge0 145B passed 13/22, compared with 11/22 each for Qwen 3.8 27B and DaisyRose 27B.](assets/homelab-edge0.png)](assets/homelab-edge0.png)
+
+## Cyber results
 
 [View the benchmark results](https://lbgos.dev/bench/).
 
@@ -21,21 +33,7 @@ The Qwen 3.8 Flash Next and GLM 5.3 Flash runs are local runs submitted by a par
 
 To run the scored tasks on your own setup, email contact@lbgos.dev or message [@lbgosna](https://x.com/lbgosna) on X.
 
-## Cyber
-
-Needs Python 3.11+, Docker and Compose. Run from `cyber/`.
-
-```bash
-cd cyber
-make check
-python3 -m rangebench preflight
-python3 -m rangebench check jwt-none
-python3 -m rangebench run --model <model> --base-url <url> --trials 3 jwt-none
-```
-
-`make check` runs ruff, mypy and the unit tests without Docker. A run needs an OpenAI-compatible `/v1/chat/completions` endpoint (`--provider anthropic` for `/v1/messages`) and writes transcripts, `manifest.json` and `report.html` under `cyber/results/`. Private tasks live in `cyber/suite/` (gitignored). [cyber/README.md](cyber/README.md) covers profiles, launching several models, scoring and the task format.
-
-## Homelab
+## Run the HomeLab example
 
 Needs Python 3.12+ and bwrap. Run from `homelab/`.
 
